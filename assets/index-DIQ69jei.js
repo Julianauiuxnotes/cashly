@@ -21,7 +21,7 @@ Error generating stack: `+e.message+`
 }
 .pos-root *{box-sizing:border-box;}
 .pos-root button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit;}
-.pos-root input{font-family:inherit;}
+.pos-root input{font-family:inherit;color:inherit;}
 .loading{display:grid;place-items:center;height:100vh;color:var(--muted);font-family:var(--mono);}
 
 /* header */
@@ -273,7 +273,7 @@ Error generating stack: `+e.message+`
 .field-label{display:block;font-size:12.5px;font-weight:600;color:var(--muted);
   margin:12px 0 6px;text-align:left;}
 .text-input{width:100%;height:46px;border:1px solid var(--line);border-radius:11px;
-  padding:0 13px;font-size:15px;outline:none;background:var(--paper);transition:.12s;}
+  padding:0 13px;font-size:15px;outline:none;background:var(--paper);color:#182338;transition:.12s;}
 .text-input:focus{border-color:var(--accent);background:var(--card);
   box-shadow:0 0 0 3px var(--accent-soft);}
 .cash-input{display:flex;align-items:center;gap:8px;height:46px;border:1px solid var(--line);
