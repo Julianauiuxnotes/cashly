@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340.16 203.12">
+  <defs>
+    <style>
+      .cls-1 {
+        letter-spacing: 0em;
+      }
+
+      .cls-2 {
+        letter-spacing: 0em;
+      }
+
+      .cls-3 {
+        fill: #ffce07;
+      }
+
+      .cls-4 {
+        fill: #109488;
+        font-family: MyriadConceptRoman-Bold, 'Myriad Variable Concept';
+        font-size: 130.17px;
+        font-variation-settings: 'wght' 700, 'wdth' 100;
+        font-weight: 700;
+      }
+
+      .cls-5 {
+        letter-spacing: -.05em;
+      }
+
+      .cls-6 {
+        letter-spacing: -.01em;
+      }
+    </style>
+  </defs>
+  <circle class="cls-3" cx="101.56" cy="101.56" r="101.56"/>
+  <text class="cls-4" transform="translate(33.57 141.19) scale(.75 1)"><tspan class="cls-6" x="0" y="0">C</tspan><tspan class="cls-2" x="76.15" y="0">ash</tspan><tspan class="cls-1" x="277.66" y="0">l</tspan><tspan class="cls-5" x="313.58" y="0">y</tspan><tspan x="375.41" y="0">.</tspan></text>
+</svg>
