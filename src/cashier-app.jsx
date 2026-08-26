@@ -4,29 +4,28 @@ import {
   Package, Store, Receipt, Wallet, ArrowLeft, ChevronRight, ChevronDown,
   LayoutDashboard, TrendingUp, Clock, CheckCircle2, MoreVertical,
   Settings, LogOut, User, Mail, Lock, ArrowRight, CircleArrowRight, Eye, EyeOff,
+  BarChart3,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ *
- * Storage: uses the artifact persistent-storage API, with an
- * in-memory fallback so the app still runs if it's unavailable.
+ * Storage: persists to the browser's localStorage, so data survives
+ * page reloads and browser restarts on this device. Falls back to an
+ * in-memory copy if localStorage is unavailable (e.g. private mode).
  * ------------------------------------------------------------------ */
 const mem = {};
+const STORAGE_PREFIX = "cashly:";
 const store = {
   async get(key, fallback) {
     try {
-      if (typeof window !== "undefined" && window.storage) {
-        const r = await window.storage.get(key);
-        return r ? JSON.parse(r.value) : fallback;
-      }
-    } catch (e) { /* missing key throws — treat as empty */ }
+      const raw = window.localStorage.getItem(STORAGE_PREFIX + key);
+      if (raw !== null) return JSON.parse(raw);
+    } catch (e) { /* localStorage unavailable — fall through */ }
     return key in mem ? mem[key] : fallback;
   },
   async set(key, value) {
     mem[key] = value;
     try {
-      if (typeof window !== "undefined" && window.storage) {
-        await window.storage.set(key, JSON.stringify(value));
-      }
+      window.localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(value));
     } catch (e) { /* ignore, in-memory copy already held */ }
   },
 };
@@ -36,13 +35,47 @@ const uid = () =>
     ? crypto.randomUUID()
     : "id-" + Date.now() + "-" + Math.random().toString(36).slice(2));
 
+// Plays a short "cha-ching" chime on sale completion — synthesized on the
+// fly with the Web Audio API, so no sound file is needed.
+function playChaChing() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const now = ctx.currentTime;
+    const notes = [
+      { freq: 1046.5, start: 0, dur: 0.09 },
+      { freq: 1318.5, start: 0.08, dur: 0.12 },
+      { freq: 1568.0, start: 0.18, dur: 0.28 },
+    ];
+    notes.forEach(({ freq, start, dur }) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "triangle";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, now + start);
+      gain.gain.exponentialRampToValueAtTime(0.6, now + start + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(now + start);
+      osc.stop(now + start + dur + 0.02);
+    });
+    setTimeout(() => ctx.close(), 700);
+  } catch (e) { /* audio unavailable — silently skip */ }
+}
+
 const rp = (n) => "Rp " + Math.round(n || 0).toLocaleString("id-ID");
 
-// Assign stable sequential Order #s (earliest sale = #1).
+// Assign stable sequential Order #s, restarting at #1 each calendar day.
 function numberSales(list) {
   const byTime = [...list].sort((a, b) => a.at - b.at);
+  const seenPerDay = {};
   const num = {};
-  byTime.forEach((s, i) => (num[s.id] = i + 1));
+  byTime.forEach((s) => {
+    const day = new Date(s.at).toDateString();
+    seenPerDay[day] = (seenPerDay[day] || 0) + 1;
+    num[s.id] = seenPerDay[day];
+  });
   return list.map((s) => ({ ...s, orderNo: num[s.id] }));
 }
 
@@ -149,6 +182,68 @@ export default function CashierApp() {
     return { count: t.length, revenue: t.reduce((s, x) => s + x.total, 0) };
   }, [sales]);
 
+  /* ---- analytics ---- */
+  const [analyticsRange, setAnalyticsRange] = useState("month"); // 'today' | 'week' | 'month' | 'all'
+
+  const analytics = useMemo(() => {
+    const now = Date.now();
+    const rangeMs = {
+      today: 24 * 60 * 60 * 1000,
+      week: 7 * 24 * 60 * 60 * 1000,
+      month: 30 * 24 * 60 * 60 * 1000,
+      all: Infinity,
+    }[analyticsRange];
+    const rangeSales = analyticsRange === "all"
+      ? sales
+      : sales.filter((s) => now - s.at <= rangeMs);
+
+    const perItem = {};
+    items.forEach((i) => {
+      perItem[i.name] = { name: i.name, category: i.category || "Uncategorized", qty: 0, revenue: 0 };
+    });
+    rangeSales.forEach((s) => {
+      (s.lines || []).forEach((l) => {
+        if (!perItem[l.name])
+          perItem[l.name] = { name: l.name, category: "Uncategorized", qty: 0, revenue: 0 };
+        perItem[l.name].qty += l.qty;
+        perItem[l.name].revenue += l.price * l.qty;
+      });
+    });
+
+    const lastSoldAt = {};
+    sales.forEach((s) => {
+      (s.lines || []).forEach((l) => {
+        if (!lastSoldAt[l.name] || s.at > lastSoldAt[l.name]) lastSoldAt[l.name] = s.at;
+      });
+    });
+
+    const rows = Object.values(perItem);
+    const topSellers = [...rows]
+      .filter((r) => r.revenue > 0)
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 5);
+    const underperformers = [...rows].sort((a, b) => a.revenue - b.revenue).slice(0, 5);
+
+    const categoryMap = {};
+    rows.forEach((r) => {
+      categoryMap[r.category] = (categoryMap[r.category] || 0) + r.revenue;
+    });
+    const categories = Object.entries(categoryMap)
+      .map(([name, revenue]) => ({ name, revenue }))
+      .sort((a, b) => b.revenue - a.revenue);
+    const maxCategoryRevenue = Math.max(1, ...categories.map((c) => c.revenue));
+
+    const totalRevenue = rangeSales.reduce((s, x) => s + x.total, 0);
+    const totalQty = rows.reduce((s, r) => s + r.qty, 0);
+    const avgOrder = rangeSales.length ? totalRevenue / rangeSales.length : 0;
+
+    return {
+      topSellers, underperformers, categories, maxCategoryRevenue,
+      totalRevenue, totalQty, avgOrder, lastSoldAt,
+      orderCount: rangeSales.length,
+    };
+  }, [sales, items, analyticsRange]);
+
   /* ---- cart ops ---- */
   const add = (id) =>
     setCart((c) => {
@@ -179,10 +274,14 @@ export default function CashierApp() {
       lines: lines.map((l) => ({ name: l.name, price: l.price, qty: l.qty })),
     };
     setSales((s) => {
-      const nextNo = s.reduce((m, x) => Math.max(m, x.orderNo || 0), 0) + 1;
+      const today = new Date(sale.at).toDateString();
+      const nextNo = s
+        .filter((x) => new Date(x.at).toDateString() === today)
+        .reduce((m, x) => Math.max(m, x.orderNo || 0), 0) + 1;
       return [{ ...sale, orderNo: nextNo }, ...s].slice(0, 200);
     });
     setSuccess({ total, change: Math.max(0, change) });
+    playChaChing();
     setPaying(false);
     setCart([]);
     setCash("");
@@ -358,6 +457,12 @@ export default function CashierApp() {
                   <Package size={15} /> Inventory
                 </button>
                 <button
+                  className={"menu-item" + (view === "analytics" ? " active" : "")}
+                  onClick={() => { setMenuOpen(false); setView("analytics"); }}
+                >
+                  <BarChart3 size={15} /> Analytics
+                </button>
+                <button
                   className={"menu-item" + (view === "settings" ? " active" : "")}
                   onClick={() => { setMenuOpen(false); setView("settings"); }}
                 >
@@ -424,11 +529,22 @@ export default function CashierApp() {
               </div>
             ) : (
               <div className="txn-list">
-                {sales.map((s) => {
+                {sales.map((s, idx) => {
                   const isOpen = openOrder === s.id;
                   const qty = (s.lines || []).reduce((a, l) => a + l.qty, 0);
+                  const day = new Date(s.at).toDateString();
+                  const prevDay = idx > 0 ? new Date(sales[idx - 1].at).toDateString() : null;
+                  const showDateHeader = day !== prevDay;
                   return (
-                    <div className={"txn" + (isOpen ? " open" : "")} key={s.id}>
+                    <React.Fragment key={s.id}>
+                      {showDateHeader && (
+                        <div className="txn-date-group">
+                          {new Date(s.at).toLocaleDateString("en-GB", {
+                            day: "2-digit", month: "short", year: "numeric",
+                          })}
+                        </div>
+                      )}
+                    <div className={"txn" + (isOpen ? " open" : "")}>
                       <button
                         className="txn-row"
                         onClick={() => setOpenOrder(isOpen ? null : s.id)}
@@ -480,6 +596,7 @@ export default function CashierApp() {
                         </div>
                       )}
                     </div>
+                    </React.Fragment>
                   );
                 })}
               </div>
@@ -695,6 +812,148 @@ export default function CashierApp() {
               ))}
             </div>
           )}
+        </main>
+      )}
+
+      {/* ---------- ANALYTICS ---------- */}
+      {view === "analytics" && (
+        <main className="analytics">
+          <div className="analytics-head">
+            <h2>Analytics</h2>
+            <div className="range-toggle">
+              {[
+                { key: "today", label: "Today" },
+                { key: "week", label: "This week" },
+                { key: "month", label: "This month" },
+                { key: "all", label: "All time" },
+              ].map((r) => (
+                <button
+                  key={r.key}
+                  className={analyticsRange === r.key ? "on" : ""}
+                  onClick={() => setAnalyticsRange(r.key)}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="an-summary">
+            <div className="an-stat">
+              <span className="an-label">Total revenue</span>
+              <span className="an-value">{rp(analytics.totalRevenue)}</span>
+            </div>
+            <div className="an-stat">
+              <span className="an-label">Items sold</span>
+              <span className="an-value">{analytics.totalQty}</span>
+            </div>
+            <div className="an-stat">
+              <span className="an-label">Avg order value</span>
+              <span className="an-value">{rp(analytics.avgOrder)}</span>
+            </div>
+          </div>
+
+          <section className="an-section">
+            <h3>Top sellers</h3>
+            {analytics.topSellers.length === 0 ? (
+              <div className="empty big">
+                <TrendingUp size={28} />
+                <p>No sales in this period yet.</p>
+              </div>
+            ) : (
+              <div className="an-list">
+                {analytics.topSellers.map((r, i) => {
+                  const pct = Math.round(
+                    (r.revenue / (analytics.topSellers[0].revenue || 1)) * 100
+                  );
+                  return (
+                    <div className="an-row" key={r.name}>
+                      <span className="an-rank">#{i + 1}</span>
+                      <div className="an-info">
+                        <div className="an-info-top">
+                          <span className="an-name">{r.name}</span>
+                          <span className="an-amount">{rp(r.revenue)}</span>
+                        </div>
+                        <div className="an-bar-track">
+                          <div className="an-bar-fill" style={{ width: pct + "%" }} />
+                        </div>
+                        <span className="an-sub">{r.qty} sold · {r.category}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          <section className="an-section">
+            <h3>Needs attention</h3>
+            {analytics.underperformers.length === 0 ? (
+              <div className="empty big">
+                <Package size={28} />
+                <p>Not enough data yet.</p>
+              </div>
+            ) : (
+              <div className="an-list">
+                {analytics.underperformers.map((r) => {
+                  const last = analytics.lastSoldAt[r.name];
+                  const daysSince = last
+                    ? Math.floor((Date.now() - last) / 86400000)
+                    : null;
+                  const note = !last
+                    ? "Never sold"
+                    : r.qty === 0
+                    ? `No sales in ${daysSince} day${daysSince !== 1 ? "s" : ""}`
+                    : null;
+                  return (
+                    <div className="an-row" key={r.name}>
+                      <div className="an-info">
+                        <div className="an-info-top">
+                          <span className="an-name">{r.name}</span>
+                          <span className="an-amount muted">{rp(r.revenue)}</span>
+                        </div>
+                        <span className="an-sub">
+                          {r.qty} sold · {r.category}
+                          {note && <span className="an-flag"> · {note}</span>}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          <section className="an-section">
+            <h3>Revenue by category</h3>
+            {analytics.categories.length === 0 ? (
+              <div className="empty big">
+                <Store size={28} />
+                <p>No category data yet.</p>
+              </div>
+            ) : (
+              <div className="an-list">
+                {analytics.categories.map((c) => {
+                  const pct = Math.round(
+                    (c.revenue / analytics.maxCategoryRevenue) * 100
+                  );
+                  return (
+                    <div className="an-row" key={c.name}>
+                      <div className="an-info">
+                        <div className="an-info-top">
+                          <span className="an-name">{c.name}</span>
+                          <span className="an-amount">{rp(c.revenue)}</span>
+                        </div>
+                        <div className="an-bar-track">
+                          <div className="an-bar-fill cat" style={{ width: pct + "%" }} />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
         </main>
       )}
 
@@ -1181,7 +1440,7 @@ function Style() {
 }
 .pos-root *{box-sizing:border-box;}
 .pos-root button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit;}
-.pos-root input{font-family:inherit;}
+.pos-root input{font-family:inherit;color:inherit;}
 .loading{display:grid;place-items:center;height:100vh;color:var(--muted);font-family:var(--mono);}
 
 /* header */
@@ -1378,13 +1637,55 @@ function Style() {
   line-height:1;}
 .tc-divider{width:1px;height:52px;background:rgba(255,255,255,.14);}
 
+/* ---- analytics ---- */
+.analytics{max-width:820px;margin:0 auto;padding:26px 22px;}
+.analytics-head{display:flex;align-items:center;justify-content:space-between;
+  flex-wrap:wrap;gap:12px;margin-bottom:20px;}
+.analytics-head h2{font-family:var(--display);font-size:22px;font-weight:700;margin:0;
+  letter-spacing:-.01em;color:#182338;}
+.range-toggle{display:flex;gap:4px;background:var(--paper);border:1px solid var(--line);
+  border-radius:12px;padding:4px;}
+.range-toggle button{padding:8px 14px;border-radius:9px;font-weight:600;font-size:13px;
+  color:var(--muted);white-space:nowrap;transition:.15s;}
+.range-toggle button.on{background:var(--card);color:var(--ink);
+  box-shadow:0 1px 3px rgba(24,35,56,.12);}
+
+.an-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:28px;}
+.an-stat{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  padding:16px 18px;display:flex;flex-direction:column;gap:6px;}
+.an-label{font-size:12.5px;color:var(--muted);font-weight:600;}
+.an-value{font-family:var(--display);font-size:21px;font-weight:700;color:#182338;}
+
+.an-section{margin-bottom:28px;}
+.an-section h3{font-family:var(--display);font-size:16px;font-weight:700;margin:0 0 12px;
+  color:#182338;}
+.an-list{display:flex;flex-direction:column;gap:10px;}
+.an-row{display:flex;align-items:center;gap:12px;background:var(--card);
+  border:1px solid var(--line);border-radius:14px;padding:12px 14px;}
+.an-rank{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--muted);
+  width:26px;flex-shrink:0;}
+.an-info{flex:1;min-width:0;}
+.an-info-top{display:flex;justify-content:space-between;gap:10px;margin-bottom:6px;}
+.an-name{font-weight:600;font-size:14.5px;color:var(--ink);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;}
+.an-amount{font-weight:700;font-size:14.5px;color:#182338;flex-shrink:0;}
+.an-amount.muted{color:var(--muted);}
+.an-bar-track{height:6px;border-radius:4px;background:var(--paper);overflow:hidden;
+  margin-bottom:6px;}
+.an-bar-fill{height:100%;border-radius:4px;background:var(--accent);}
+.an-bar-fill.cat{background:#109488;}
+.an-sub{font-size:12.5px;color:var(--muted);}
+.an-flag{color:var(--danger);font-weight:600;}
+
 .history{margin-top:24px;}
 .history-head{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px;}
 .history-head h2{font-family:var(--display);font-size:20px;font-weight:700;margin:0;
-  letter-spacing:-.01em;}
+  letter-spacing:-.01em;color:#182338;}
 .history-count{font-size:13px;color:var(--muted);font-family:var(--mono);}
 
 .txn-list{display:flex;flex-direction:column;gap:8px;}
+.txn-date-group{font-family:var(--mono);font-size:14px;color:var(--ink);margin-top:8px;}
+.txn-date-group:first-child{margin-top:0;}
 .txn{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;
   transition:border-color .12s,box-shadow .12s;}
 .txn:hover{border-color:#dcd6c7;}
@@ -1433,7 +1734,7 @@ function Style() {
 .field-label{display:block;font-size:12.5px;font-weight:600;color:var(--muted);
   margin:12px 0 6px;text-align:left;}
 .text-input{width:100%;height:46px;border:1px solid var(--line);border-radius:11px;
-  padding:0 13px;font-size:15px;outline:none;background:var(--paper);transition:.12s;}
+  padding:0 13px;font-size:15px;outline:none;background:var(--paper);color:#182338;transition:.12s;}
 .text-input:focus{border-color:var(--accent);background:var(--card);
   box-shadow:0 0 0 3px var(--accent-soft);}
 .cash-input{display:flex;align-items:center;gap:8px;height:46px;border:1px solid var(--line);
