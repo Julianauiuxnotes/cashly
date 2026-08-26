@@ -64,7 +64,30 @@ function playChaChing() {
   } catch (e) { /* audio unavailable — silently skip */ }
 }
 
-const rp = (n) => "Rp " + Math.round(n || 0).toLocaleString("id-ID");
+const rp = (n) => {
+  const v = Math.round(n || 0);
+  return (v < 0 ? "-Rp " : "Rp ") + Math.abs(v).toLocaleString("id-ID");
+};
+
+// Parses a raw price-field string (may start with "-") into a signed number.
+const parsePriceInput = (raw) => {
+  const str = String(raw ?? "");
+  const neg = str.trim().startsWith("-");
+  const digits = str.replace(/[^\d]/g, "");
+  const n = Number(digits) || 0;
+  return neg ? -n : n;
+};
+
+// Displays a raw price-field string with thousands separators, preserving
+// a leading "-" the user has typed even before any digits follow it.
+const formatPriceInput = (raw) => {
+  const str = String(raw ?? "");
+  if (!str) return "";
+  const neg = str.trim().startsWith("-");
+  const digits = str.replace(/[^\d]/g, "");
+  if (!digits) return neg ? "-" : "";
+  return (neg ? "-" : "") + Number(digits).toLocaleString("id-ID");
+};
 
 // yyyy-mm-dd in the local timezone, for <input type="date"> values.
 const toDateStr = (d) => {
@@ -311,7 +334,7 @@ export default function CashierApp() {
     setItemForm({ mode: "edit", ...it, price: String(it.price) });
   const saveItem = () => {
     const name = itemForm.name.trim();
-    const price = Number(String(itemForm.price).replace(/[^\d]/g, "")) || 0;
+    const price = parsePriceInput(itemForm.price);
     if (!name) return;
     if (itemForm.mode === "add") {
       setItems((a) => [
@@ -346,6 +369,36 @@ export default function CashierApp() {
     });
   };
   const endDrag = () => { setDragIndex(null); setOverIndex(null); };
+
+  // Pointer Events (not native HTML5 DnD) so reorder works on touch too —
+  // mobile browsers never fire dragstart/dragover for HTML5 drag-and-drop.
+  const overIndexRef = useRef(null);
+  useEffect(() => { overIndexRef.current = overIndex; }, [overIndex]);
+  useEffect(() => {
+    if (dragIndex === null) return;
+    const handleMove = (e) => {
+      e.preventDefault();
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      const row = el && el.closest && el.closest(".trow[data-idx]");
+      if (row) {
+        const idx = Number(row.dataset.idx);
+        if (idx !== overIndexRef.current) setOverIndex(idx);
+      }
+    };
+    const handleUp = () => {
+      if (overIndexRef.current !== null) handleDrop(overIndexRef.current);
+      endDrag();
+    };
+    window.addEventListener("pointermove", handleMove, { passive: false });
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dragIndex]);
 
   /* ---- auth ---- */
   const emailOk = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
@@ -826,14 +879,15 @@ export default function CashierApp() {
                     (overIndex === idx && dragIndex !== null && dragIndex !== idx ? " drag-over" : "")
                   }
                   key={it.id}
-                  onDragOver={(e) => { e.preventDefault(); if (overIndex !== idx) setOverIndex(idx); }}
-                  onDrop={(e) => { e.preventDefault(); handleDrop(idx); }}
-                  onDragEnd={endDrag}
+                  data-idx={idx}
                 >
                   <span
                     className="drag-handle"
-                    draggable
-                    onDragStart={() => setDragIndex(idx)}
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      setDragIndex(idx);
+                      setOverIndex(idx);
+                    }}
                     title="Drag to reorder"
                   >
                     <GripVertical size={15} />
@@ -1132,15 +1186,8 @@ export default function CashierApp() {
             <div className="cash-input">
               <span>Rp</span>
               <input
-                inputMode="numeric"
                 placeholder="0"
-                value={
-                  itemForm.price
-                    ? Number(
-                        String(itemForm.price).replace(/[^\d]/g, "") || 0
-                      ).toLocaleString("id-ID")
-                    : ""
-                }
+                value={formatPriceInput(itemForm.price)}
                 onChange={(e) => setItemForm({ ...itemForm, price: e.target.value })}
               />
             </div>
@@ -1672,7 +1719,7 @@ function Style() {
 .trow.dragging{opacity:.4;}
 .trow.drag-over{box-shadow:inset 0 2px 0 var(--accent);}
 .drag-handle{display:flex;align-items:center;justify-content:center;color:#c3c9d4;
-  cursor:grab;}
+  cursor:grab;touch-action:none;}
 .drag-handle:hover{color:var(--muted);}
 .drag-handle:active{cursor:grabbing;}
 .td-name{font-weight:600;font-size:15px;}
