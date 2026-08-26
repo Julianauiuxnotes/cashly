@@ -4,7 +4,7 @@ import {
   Package, Store, Receipt, Wallet, ArrowLeft, ChevronRight, ChevronDown,
   LayoutDashboard, TrendingUp, Clock, CheckCircle2, MoreVertical,
   Settings, LogOut, User, Mail, Lock, ArrowRight, CircleArrowRight, Eye, EyeOff,
-  BarChart3,
+  BarChart3, GripVertical,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ *
@@ -66,6 +66,12 @@ function playChaChing() {
 
 const rp = (n) => "Rp " + Math.round(n || 0).toLocaleString("id-ID");
 
+// yyyy-mm-dd in the local timezone, for <input type="date"> values.
+const toDateStr = (d) => {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+
 // Assign stable sequential Order #s, restarting at #1 each calendar day.
 function numberSales(list) {
   const byTime = [...list].sort((a, b) => a.at - b.at);
@@ -109,6 +115,8 @@ export default function CashierApp() {
 
   const [itemForm, setItemForm] = useState(null); // {mode, id, name, price, category}
   const [confirmDelete, setConfirmDelete] = useState(null);
+  const [dragIndex, setDragIndex] = useState(null);
+  const [overIndex, setOverIndex] = useState(null);
   const [openOrder, setOpenOrder] = useState(null); // expanded transaction id
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -183,19 +191,27 @@ export default function CashierApp() {
   }, [sales]);
 
   /* ---- analytics ---- */
-  const [analyticsRange, setAnalyticsRange] = useState("month"); // 'today' | 'week' | 'month' | 'all'
+  const [analyticsRange, setAnalyticsRange] = useState("month"); // 'today' | 'week' | 'month' | 'all' | 'custom'
+  const [customFrom, setCustomFrom] = useState(() => toDateStr(new Date()));
+  const [customTo, setCustomTo] = useState(() => toDateStr(new Date()));
 
   const analytics = useMemo(() => {
     const now = Date.now();
-    const rangeMs = {
-      today: 24 * 60 * 60 * 1000,
-      week: 7 * 24 * 60 * 60 * 1000,
-      month: 30 * 24 * 60 * 60 * 1000,
-      all: Infinity,
-    }[analyticsRange];
-    const rangeSales = analyticsRange === "all"
-      ? sales
-      : sales.filter((s) => now - s.at <= rangeMs);
+    let rangeSales;
+    if (analyticsRange === "all") {
+      rangeSales = sales;
+    } else if (analyticsRange === "custom") {
+      const start = new Date(customFrom + "T00:00:00").getTime();
+      const end = new Date(customTo + "T23:59:59.999").getTime();
+      rangeSales = sales.filter((s) => s.at >= start && s.at <= end);
+    } else {
+      const rangeMs = {
+        today: 24 * 60 * 60 * 1000,
+        week: 7 * 24 * 60 * 60 * 1000,
+        month: 30 * 24 * 60 * 60 * 1000,
+      }[analyticsRange];
+      rangeSales = sales.filter((s) => now - s.at <= rangeMs);
+    }
 
     const perItem = {};
     items.forEach((i) => {
@@ -242,7 +258,7 @@ export default function CashierApp() {
       totalRevenue, totalQty, avgOrder, lastSoldAt,
       orderCount: rangeSales.length,
     };
-  }, [sales, items, analyticsRange]);
+  }, [sales, items, analyticsRange, customFrom, customTo]);
 
   /* ---- cart ops ---- */
   const add = (id) =>
@@ -318,6 +334,18 @@ export default function CashierApp() {
     setCart((c) => c.filter((x) => x.itemId !== id));
     setConfirmDelete(null);
   };
+
+  /* ---- reorder (drag and drop) ---- */
+  const handleDrop = (dropIdx) => {
+    if (dragIndex === null || dragIndex === dropIdx) return;
+    setItems((a) => {
+      const next = [...a];
+      const [moved] = next.splice(dragIndex, 1);
+      next.splice(dropIdx, 0, moved);
+      return next;
+    });
+  };
+  const endDrag = () => { setDragIndex(null); setOverIndex(null); };
 
   /* ---- auth ---- */
   const emailOk = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
@@ -784,13 +812,32 @@ export default function CashierApp() {
           ) : (
             <div className="table">
               <div className="thead">
+                <span />
                 <span>Item</span>
                 <span>Category</span>
                 <span className="ta-r">Price</span>
                 <span />
               </div>
-              {items.map((it) => (
-                <div className="trow" key={it.id}>
+              {items.map((it, idx) => (
+                <div
+                  className={
+                    "trow" +
+                    (dragIndex === idx ? " dragging" : "") +
+                    (overIndex === idx && dragIndex !== null && dragIndex !== idx ? " drag-over" : "")
+                  }
+                  key={it.id}
+                  onDragOver={(e) => { e.preventDefault(); if (overIndex !== idx) setOverIndex(idx); }}
+                  onDrop={(e) => { e.preventDefault(); handleDrop(idx); }}
+                  onDragEnd={endDrag}
+                >
+                  <span
+                    className="drag-handle"
+                    draggable
+                    onDragStart={() => setDragIndex(idx)}
+                    title="Drag to reorder"
+                  >
+                    <GripVertical size={15} />
+                  </span>
                   <span className="td-name">{it.name}</span>
                   <span className="td-cat">
                     {it.category ? <em className="chip">{it.category}</em> : <span className="dash">—</span>}
@@ -826,6 +873,7 @@ export default function CashierApp() {
                 { key: "week", label: "This week" },
                 { key: "month", label: "This month" },
                 { key: "all", label: "All time" },
+                { key: "custom", label: "Custom" },
               ].map((r) => (
                 <button
                   key={r.key}
@@ -837,6 +885,30 @@ export default function CashierApp() {
               ))}
             </div>
           </div>
+
+          {analyticsRange === "custom" && (
+            <div className="custom-range">
+              <label>
+                From
+                <input
+                  type="date"
+                  value={customFrom}
+                  max={customTo}
+                  onChange={(e) => setCustomFrom(e.target.value)}
+                />
+              </label>
+              <label>
+                To
+                <input
+                  type="date"
+                  value={customTo}
+                  min={customFrom}
+                  max={toDateStr(new Date())}
+                  onChange={(e) => setCustomTo(e.target.value)}
+                />
+              </label>
+            </div>
+          )}
 
           <div className="an-summary">
             <div className="an-stat">
@@ -1589,14 +1661,20 @@ function Style() {
 .add-item:hover{background:#0f1728;transform:translateY(-1px);}
 
 .table{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden;}
-.thead,.trow{display:grid;grid-template-columns:1fr 150px 130px 92px;align-items:center;
+.thead,.trow{display:grid;grid-template-columns:22px 1fr 150px 130px 92px;align-items:center;
   gap:12px;padding:13px 18px;}
 .thead{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);
   background:var(--paper);font-weight:700;border-bottom:1px solid var(--line);}
 .ta-r{text-align:right;}
 .trow+.trow,.thead+.trow{border-top:1px solid var(--line);}
-.trow{transition:background .12s;}
+.trow{transition:background .12s,opacity .12s,box-shadow .12s;}
 .trow:hover{background:#fdfbf6;}
+.trow.dragging{opacity:.4;}
+.trow.drag-over{box-shadow:inset 0 2px 0 var(--accent);}
+.drag-handle{display:flex;align-items:center;justify-content:center;color:#c3c9d4;
+  cursor:grab;}
+.drag-handle:hover{color:var(--muted);}
+.drag-handle:active{cursor:grabbing;}
 .td-name{font-weight:600;font-size:15px;}
 .td-cat .dash{color:#c3c9d4;}
 .td-price{font-family:var(--mono);font-size:14.5px;text-align:right;}
@@ -1650,6 +1728,15 @@ function Style() {
 .range-toggle button.on{background:var(--card);color:var(--ink);
   box-shadow:0 1px 3px rgba(24,35,56,.12);}
 
+.custom-range{display:flex;flex-wrap:wrap;gap:14px;background:var(--card);
+  border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin:-8px 0 20px;}
+.custom-range label{display:flex;flex-direction:column;gap:5px;font-size:12px;
+  font-weight:600;color:var(--muted);}
+.custom-range input{font-family:var(--mono);font-size:14px;color:var(--ink);
+  background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:8px 10px;}
+.custom-range input:focus{outline:none;border-color:var(--accent);
+  box-shadow:0 0 0 3px var(--accent-soft);}
+
 .an-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:28px;}
 .an-stat{background:var(--card);border:1px solid var(--line);border-radius:16px;
   padding:16px 18px;display:flex;flex-direction:column;gap:6px;}
@@ -1684,7 +1771,7 @@ function Style() {
 .history-count{font-size:13px;color:var(--muted);font-family:var(--mono);}
 
 .txn-list{display:flex;flex-direction:column;gap:8px;}
-.txn-date-group{font-family:var(--mono);font-size:14px;color:var(--ink);margin-top:8px;}
+.txn-date-group{font-family:var(--mono);font-size:14px;color:var(--ink);margin-top:8px;text-align:left;}
 .txn-date-group:first-child{margin-top:0;}
 .txn{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;
   transition:border-color .12s,box-shadow .12s;}
@@ -1886,9 +1973,9 @@ function Style() {
   .mb-count{font-size:13px;color:#c6cdda;}
   .mb-total{font-family:var(--mono);font-weight:500;font-size:16px;}
   .mb-cta{margin-left:auto;display:flex;align-items:center;gap:4px;font-weight:600;font-size:14px;}
-  .thead,.trow{grid-template-columns:1fr 88px 78px;}
+  .thead,.trow{grid-template-columns:18px 1fr 88px 78px;}
   .td-cat{display:none;}
-  .thead span:nth-child(2){display:none;}
+  .thead span:nth-child(3){display:none;}
 
   .today-card{padding:20px;}
   .tc-amount,.tc-count{font-size:30px;}
