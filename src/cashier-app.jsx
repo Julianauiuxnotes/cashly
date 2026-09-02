@@ -4,7 +4,7 @@ import {
   Package, Store, Receipt, Wallet, ArrowLeft, ChevronRight, ChevronDown,
   LayoutDashboard, TrendingUp, Clock, CheckCircle2, MoreVertical,
   Settings, LogOut, User, Mail, Lock, ArrowRight, CircleArrowRight, Eye, EyeOff,
-  BarChart3, GripVertical,
+  BarChart3, GripVertical, Bluetooth, Printer,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ *
@@ -89,6 +89,82 @@ const formatPriceInput = (raw) => {
   return (neg ? "-" : "") + Number(digits).toLocaleString("id-ID");
 };
 
+/* ------------------------------------------------------------------ *
+ * Bluetooth receipt printing (ESC/POS over Web Bluetooth).
+ *
+ * Web Bluetooth is only implemented by Chromium browsers (Chrome/Edge
+ * on Android and desktop) — no iOS browser supports it, since Apple
+ * restricts every iOS browser to WebKit and WebKit has no Web
+ * Bluetooth API. There is no in-browser workaround for that; on iOS
+ * we fall back to the native print dialog (window.print) instead,
+ * which can route to an AirPrint printer.
+ *
+ * Cheap ESC/POS thermal printers vary in which GATT service exposes
+ * their write characteristic. Web Bluetooth also only allows
+ * `getPrimaryService(s)` for UUIDs the page declared up front, so we
+ * list the service UUIDs seen across common printer models here and
+ * probe each one for a writable characteristic after connecting. A
+ * printer using a service not listed below will need its UUID added.
+ * ------------------------------------------------------------------ */
+const PRINTER_SERVICE_UUIDS = [
+  "000018f0-0000-1000-8000-00805f9b34fb",
+  "0000ff00-0000-1000-8000-00805f9b34fb",
+  "49535343-fe7d-4ae5-8fa9-9fafd205e455",
+  "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+  "e7810a71-73ae-499d-8c15-faa9aef0c3f2",
+];
+
+const bluetoothSupported =
+  typeof navigator !== "undefined" && !!navigator.bluetooth;
+
+const ESC = 0x1b, GS = 0x1d;
+// Cheap ESC/POS printers generally only speak a single-byte codepage
+// (PC437/ASCII by default), so strip anything outside it rather than
+// risk sending bytes the printer will render as garbage.
+const textBytes = (str) =>
+  Array.from(String(str).normalize("NFKD").replace(/[^ -~]/g, ""))
+    .map((c) => c.charCodeAt(0));
+const padLine = (left, right, width = 32) => {
+  const gap = Math.max(1, width - left.length - right.length);
+  return left + " ".repeat(gap) + right;
+};
+
+function buildReceiptBytes(sale, shopName) {
+  const W = 32; // safe column count for narrow (58mm) thermal paper
+  const bytes = [];
+  const push = (...arr) => bytes.push(...arr);
+  push(ESC, 0x40); // initialize printer
+  push(ESC, 0x61, 0x01); // center align
+  push(ESC, 0x45, 0x01, ...textBytes(shopName || "My Shop"), 0x0a, ESC, 0x45, 0x00);
+  push(...textBytes(new Date(sale.at || Date.now()).toLocaleString("id-ID")), 0x0a);
+  push(...textBytes("-".repeat(W)), 0x0a);
+  push(ESC, 0x61, 0x00); // left align
+  (sale.lines || []).forEach((l) => {
+    push(...textBytes(l.name), 0x0a);
+    push(...textBytes(padLine(`  ${l.qty} x ${rp(l.price)}`, rp(l.price * l.qty), W)), 0x0a);
+  });
+  push(...textBytes("-".repeat(W)), 0x0a);
+  push(ESC, 0x45, 0x01, ...textBytes(padLine("TOTAL", rp(sale.total), W)), 0x0a, ESC, 0x45, 0x00);
+  if (sale.paid != null) push(...textBytes(padLine("Paid", rp(sale.paid), W)), 0x0a);
+  if (sale.change) push(...textBytes(padLine("Change", rp(sale.change), W)), 0x0a);
+  push(0x0a, ESC, 0x61, 0x01, ...textBytes("Thank you!"), 0x0a, 0x0a, 0x0a);
+  push(GS, 0x56, 0x00); // full cut
+  return new Uint8Array(bytes);
+}
+
+async function writeBytesToCharacteristic(characteristic, bytes) {
+  const CHUNK = 100; // stay under typical negotiated BLE MTU
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    const chunk = bytes.slice(i, i + CHUNK);
+    if (characteristic.properties.writeWithoutResponse) {
+      await characteristic.writeValueWithoutResponse(chunk);
+    } else {
+      await characteristic.writeValue(chunk);
+    }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
 // yyyy-mm-dd in the local timezone, for <input type="date"> values.
 const toDateStr = (d) => {
   const pad = (n) => String(n).padStart(2, "0");
@@ -134,7 +210,11 @@ export default function CashierApp() {
 
   const [paying, setPaying] = useState(false);
   const [cash, setCash] = useState("");
-  const [success, setSuccess] = useState(null); // {total, change}
+  const [success, setSuccess] = useState(null); // {at, total, paid, change, lines}
+
+  const [printer, setPrinter] = useState(null); // {device, characteristic, name}
+  const [printerBusy, setPrinterBusy] = useState(false);
+  const [printerMsg, setPrinterMsg] = useState(null); // {ok, text}
 
   const [itemForm, setItemForm] = useState(null); // {mode, id, name, price, category}
   const [confirmDelete, setConfirmDelete] = useState(null);
@@ -319,12 +399,91 @@ export default function CashierApp() {
         .reduce((m, x) => Math.max(m, x.orderNo || 0), 0) + 1;
       return [{ ...sale, orderNo: nextNo }, ...s].slice(0, 200);
     });
-    setSuccess({ total, change: Math.max(0, change) });
+    setSuccess(sale);
+    setPrinterMsg(null);
     playChaChing();
     setPaying(false);
     setCart([]);
     setCash("");
     setCartOpen(false);
+  };
+
+  /* ---- Bluetooth receipt printer ---- */
+  const connectPrinter = async () => {
+    if (!bluetoothSupported) return;
+    setPrinterBusy(true);
+    setPrinterMsg(null);
+    try {
+      const device = await navigator.bluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: PRINTER_SERVICE_UUIDS,
+      });
+      const server = await device.gatt.connect();
+      let characteristic = null;
+      for (const uuid of PRINTER_SERVICE_UUIDS) {
+        try {
+          const service = await server.getPrimaryService(uuid);
+          const chars = await service.getCharacteristics();
+          characteristic = chars.find(
+            (c) => c.properties.write || c.properties.writeWithoutResponse
+          );
+          if (characteristic) break;
+        } catch {
+          // this device doesn't expose that service — try the next candidate
+        }
+      }
+      if (!characteristic) {
+        throw new Error(
+          "Connected, but no printable service was found on this device."
+        );
+      }
+      device.addEventListener("gattserverdisconnected", () => {
+        setPrinter(null);
+        setPrinterMsg({ ok: false, text: "Printer disconnected." });
+      });
+      setPrinter({ device, characteristic, name: device.name || "Bluetooth printer" });
+      setPrinterMsg({ ok: true, text: `Connected to ${device.name || "printer"}.` });
+    } catch (err) {
+      if (err.name !== "NotFoundError") {
+        setPrinterMsg({ ok: false, text: err.message || "Couldn't connect to printer." });
+      }
+    } finally {
+      setPrinterBusy(false);
+    }
+  };
+
+  const disconnectPrinter = () => {
+    if (printer?.device?.gatt?.connected) printer.device.gatt.disconnect();
+    setPrinter(null);
+    setPrinterMsg(null);
+  };
+
+  const printViaBluetooth = async (sale) => {
+    if (!printer) return;
+    setPrinterBusy(true);
+    setPrinterMsg(null);
+    try {
+      await writeBytesToCharacteristic(printer.characteristic, buildReceiptBytes(sale, shopName));
+      setPrinterMsg({ ok: true, text: "Sent to printer." });
+    } catch (err) {
+      setPrinterMsg({ ok: false, text: err.message || "Print failed." });
+    } finally {
+      setPrinterBusy(false);
+    }
+  };
+
+  const testPrint = () =>
+    printViaBluetooth({
+      at: Date.now(),
+      total: 10000,
+      paid: 10000,
+      change: 0,
+      lines: [{ name: "Test print", qty: 1, price: 10000 }],
+    });
+
+  const printReceipt = (sale) => {
+    if (printer) printViaBluetooth(sale);
+    else window.print();
   };
 
   /* ---- item CRUD ---- */
@@ -1091,6 +1250,12 @@ export default function CashierApp() {
           onSave={saveProfile}
           onChangePassword={changePassword}
           onBack={() => setView("dashboard")}
+          printer={printer}
+          printerBusy={printerBusy}
+          printerMsg={printerMsg}
+          onConnectPrinter={connectPrinter}
+          onDisconnectPrinter={disconnectPrinter}
+          onTestPrint={testPrint}
         />
       )}
 
@@ -1157,10 +1322,43 @@ export default function CashierApp() {
                 Change due <strong>{rp(success.change)}</strong>
               </div>
             )}
+            <button className="new-order print-btn" onClick={() => printReceipt(success)} disabled={printerBusy}>
+              <Printer size={16} />
+              {printerBusy ? "Printing…" : printer ? "Print receipt" : "Print receipt (browser)"}
+            </button>
+            {printerMsg && (
+              <div className={"pw-msg" + (printerMsg.ok ? " ok" : " err")}>{printerMsg.text}</div>
+            )}
             <button className="new-order" onClick={() => setSuccess(null)}>
               New order
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Print-only receipt: hidden on screen, shown via @media print when
+          the browser print fallback (printReceipt) is used. */}
+      {success && (
+        <div className="print-receipt">
+          <h4>{shopName}</h4>
+          <div>{new Date(success.at || Date.now()).toLocaleString("id-ID")}</div>
+          <hr />
+          {(success.lines || []).map((l, i) => (
+            <div className="pr-line" key={i}>
+              <span>{l.name} x{l.qty}</span>
+              <span>{rp(l.price * l.qty)}</span>
+            </div>
+          ))}
+          <div className="pr-total">
+            <span>Total</span><span>{rp(success.total)}</span>
+          </div>
+          {success.paid != null && (
+            <div className="pr-line"><span>Paid</span><span>{rp(success.paid)}</span></div>
+          )}
+          {success.change > 0 && (
+            <div className="pr-line"><span>Change</span><span>{rp(success.change)}</span></div>
+          )}
+          <div className="pr-thanks">Thank you!</div>
         </div>
       )}
 
@@ -1422,7 +1620,10 @@ function AuthScreen({ mode, setMode, hasAccount, error, onLogin, onSignup, onChe
 /* ================================================================== *
  * Settings page — edit profile + change password.
  * ================================================================== */
-function SettingsPage({ account, shopName, onSave, onChangePassword, onBack }) {
+function SettingsPage({
+  account, shopName, onSave, onChangePassword, onBack,
+  printer, printerBusy, printerMsg, onConnectPrinter, onDisconnectPrinter, onTestPrint,
+}) {
   const [p, setP] = useState({
     username: account.username, shopName, email: account.email,
   });
@@ -1507,6 +1708,46 @@ function SettingsPage({ account, shopName, onSave, onChangePassword, onBack }) {
             Update password
           </button>
         </div>
+      </section>
+
+      <section className="settings-card">
+        <h3 className="settings-h">Receipt printer</h3>
+        {!bluetoothSupported ? (
+          <p className="printer-note">
+            Bluetooth printing isn't available in this browser — no browser on
+            iPhone/iPad supports it, since Apple doesn't allow it in iOS
+            WebKit. Use the "Print receipt" button after a sale instead; it
+            opens your device's print dialog, which can print via AirPrint or
+            any printer set up on this device.
+          </p>
+        ) : printer ? (
+          <>
+            <div className="printer-status">
+              <Bluetooth size={16} /> Connected to <strong>{printer.name}</strong>
+            </div>
+            <div className="settings-actions">
+              <button className="ghost" onClick={onDisconnectPrinter}>Disconnect</button>
+              <button className="save" onClick={onTestPrint} disabled={printerBusy}>
+                {printerBusy ? "Printing…" : "Test print"}
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="printer-note">
+              Pair a Bluetooth ESC/POS receipt printer to print straight from
+              this browser.
+            </p>
+            <div className="settings-actions">
+              <button className="save" onClick={onConnectPrinter} disabled={printerBusy}>
+                <Bluetooth size={16} /> {printerBusy ? "Connecting…" : "Connect printer"}
+              </button>
+            </div>
+          </>
+        )}
+        {printerMsg && (
+          <div className={"pw-msg" + (printerMsg.ok ? " ok" : " err")}>{printerMsg.text}</div>
+        )}
       </section>
     </main>
   );
@@ -1934,6 +2175,10 @@ function Style() {
 .new-order{margin-top:22px;width:100%;height:48px;border-radius:12px;background:var(--ink);
   color:#fff;font-weight:600;font-size:15px;transition:.15s;}
 .new-order:hover{background:#0f1728;}
+.new-order:disabled{opacity:.6;cursor:default;}
+.print-btn{display:flex;align-items:center;justify-content:center;gap:8px;
+  background:var(--card);border:1px solid var(--line);color:var(--ink);}
+.print-btn:hover{background:var(--card);border-color:var(--accent);}
 
 /* ---- auth ---- */
 .auth-root{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;}
@@ -1997,6 +2242,29 @@ function Style() {
 .pw-msg{font-size:13.5px;font-weight:500;padding:10px 13px;border-radius:10px;margin-top:14px;}
 .pw-msg.ok{background:var(--paid-soft);color:var(--paid);}
 .pw-msg.err{background:#fbeae4;color:var(--danger);}
+
+/* ---- receipt printer ---- */
+.printer-note{font-size:13.5px;color:var(--muted);line-height:1.5;margin:4px 0 14px;}
+.printer-status{display:flex;align-items:center;gap:8px;font-size:14px;
+  background:var(--paid-soft);color:var(--paid);padding:10px 13px;border-radius:10px;margin-bottom:14px;}
+.printer-status strong{color:inherit;}
+
+/* Print-only receipt for the native browser print fallback (used when no
+   Bluetooth printer is connected — the only option on iOS). Hidden on
+   screen; @media print swaps it in and hides the rest of the app. */
+.print-receipt{display:none;}
+@media print{
+  body *{visibility:hidden;}
+  .print-receipt,.print-receipt *{visibility:visible;}
+  .print-receipt{display:block;position:absolute;top:0;left:0;width:100%;
+    padding:16px;font-family:var(--mono);color:#000;}
+  .print-receipt h4{margin:0 0 4px;font-size:16px;text-align:center;}
+  .print-receipt hr{border:none;border-top:1px dashed #000;margin:8px 0;}
+  .print-receipt .pr-line{display:flex;justify-content:space-between;font-size:12px;margin:2px 0;}
+  .print-receipt .pr-total{display:flex;justify-content:space-between;font-weight:700;
+    border-top:1px dashed #000;margin-top:6px;padding-top:6px;}
+  .print-receipt .pr-thanks{text-align:center;margin-top:12px;}
+}
 
 /* ---- responsive ---- */
 @media (max-width:860px){
