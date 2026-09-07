@@ -139,18 +139,6 @@ const bluetoothSupported =
 const serialSupported =
   typeof navigator !== "undefined" && !!navigator.serial;
 
-// BluetoothCharacteristicProperties exposes these as getters on its
-// prototype, not as the instance's own enumerable properties — so
-// Object.entries(characteristic.properties) silently returns [] even
-// though direct access (characteristic.properties.write) works fine.
-// Named lookups are the only reliable way to enumerate them.
-const CHAR_PROPERTY_NAMES = [
-  "broadcast", "read", "writeWithoutResponse", "write", "notify",
-  "indicate", "authenticatedSignedWrites", "reliableWrite", "writableAuxiliaries",
-];
-const listCharProps = (properties) =>
-  CHAR_PROPERTY_NAMES.filter((k) => properties[k]).join(", ");
-
 // The receipt is drawn on an offscreen canvas at the print head's native
 // dot width, then converted to whatever byte format the connected
 // printer's protocol needs (see buildReceiptBytes below).
@@ -408,6 +396,47 @@ function buildReceiptBytes(sale, shopName, email) {
   return new Uint8Array(bytes);
 }
 
+/* ------------------------------------------------------------------ *
+ * Plain ESC/POS raster — for BLE printers that are genuinely ESC/POS-
+ * compliant, unlike the cat-printer/YHK families above. Sending the
+ * cat-printer protocol's framed commands to one of these prints every
+ * command byte as literal text instead of an image (they aren't
+ * recognized ESC/GS control sequences) — recognizable by the printout
+ * being made of repeating "Qx" (0x51 0x78, the cat protocol's frame
+ * prefix) and running on forever, since a full receipt is hundreds of
+ * small framed commands. Use this protocol instead when that happens.
+ * ------------------------------------------------------------------ */
+function canvasToRaster(canvas) {
+  const { width, height } = canvas;
+  const { data } = canvas.getContext("2d").getImageData(0, 0, width, height);
+  const bytesPerRow = width / 8;
+  const raster = new Uint8Array(bytesPerRow * height);
+  for (let yy = 0; yy < height; yy++) {
+    for (let xx = 0; xx < width; xx++) {
+      const idx = (yy * width + xx) * 4;
+      const a = data[idx + 3];
+      const luminance = a === 0 ? 255 : (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+      if (luminance < 200) raster[yy * bytesPerRow + (xx >> 3)] |= 0x80 >> (xx & 7);
+    }
+  }
+  return { bytesPerRow, height, raster };
+}
+
+const ESC_INIT = new Uint8Array([0x1b, 0x40]); // ESC @ — reset to defaults
+const ESC_FEED = new Uint8Array([0x0a, 0x0a, 0x0a, 0x0a]); // feed past the cutter
+
+function buildEscPosBytes(sale, shopName, email) {
+  const canvas = renderReceiptCanvas(sale, shopName, email);
+  const { bytesPerRow, height, raster } = canvasToRaster(canvas);
+  const imageCmd = new Uint8Array([
+    0x1d, 0x76, 0x30, 0x00, // GS v 0 — print raster image, normal orientation
+    bytesPerRow & 0xff, (bytesPerRow >> 8) & 0xff,
+    height & 0xff, (height >> 8) & 0xff,
+    ...raster,
+  ]);
+  return new Uint8Array([...ESC_INIT, ...imageCmd, ...ESC_FEED]);
+}
+
 async function writeBytesToCharacteristic(characteristic, bytes) {
   // Paced to what this printer family's tiny BLE RX buffer can absorb —
   // sending faster causes silent data loss (no error, truncated print).
@@ -525,7 +554,18 @@ export default function CashierApp() {
   const [printerBusy, setPrinterBusy] = useState(false);
   const [printerMsg, setPrinterMsg] = useState(null); // {ok, text}
   const [printingSale, setPrintingSale] = useState(null); // sale being sent to the browser print fallback
-  const [printerProfile, setPrinterProfile] = useState(null); // diagnostic: every service/characteristic found on the paired device
+  // Which BLE byte protocol to speak — "cat" (GB01/YHK-rabbit family, the
+  // original target hardware) or "escpos" (genuinely ESC/POS-compliant
+  // printers). Remembered per-browser since it's a property of whatever
+  // physical printer is paired, not of any one print job.
+  const [printerProtocol, setPrinterProtocol] = useState(
+    () => window.localStorage.getItem(STORAGE_PREFIX + "printerProtocol") || "escpos"
+  );
+  const choosePrinterProtocol = (v) => {
+    setPrinterProtocol(v);
+    try { window.localStorage.setItem(STORAGE_PREFIX + "printerProtocol", v); } catch { /* ignore */ }
+  };
+  const buildBleBytes = printerProtocol === "escpos" ? buildEscPosBytes : buildReceiptBytes;
 
   const [itemForm, setItemForm] = useState(null); // {mode, id, name, price, category}
   const [confirmDelete, setConfirmDelete] = useState(null);
@@ -740,48 +780,34 @@ export default function CashierApp() {
     if (!bluetoothSupported) return;
     setPrinterBusy(true);
     setPrinterMsg(null);
-    setPrinterProfile(null);
     try {
       const device = await navigator.bluetooth.requestDevice({
         acceptAllDevices: true,
         optionalServices: PRINTER_SERVICE_UUIDS,
       });
       const server = await device.gatt.connect();
-      // Scan every candidate service (not just stop at the first writable
-      // characteristic) so the full GATT profile can be inspected when the
-      // auto-picked characteristic turns out not to be the real print
-      // channel — some devices expose several writable characteristics and
-      // only one of them actually reaches the print engine.
-      const services = [];
+      // Probe every candidate service for a writable characteristic — some
+      // devices expose several, so keep scanning until one is found rather
+      // than stopping at the first service that connects.
       let characteristic = null;
       let notifyCharacteristic = null;
       for (const uuid of PRINTER_SERVICE_UUIDS) {
         try {
           const service = await server.getPrimaryService(uuid);
           const chars = await service.getCharacteristics();
-          const charInfo = chars.map((c) => ({
-            uuid: c.uuid,
-            characteristic: c,
-            props: listCharProps(c.properties),
-            writable: !!(c.properties.write || c.properties.writeWithoutResponse),
-            notifiable: !!(c.properties.notify || c.properties.indicate),
-          }));
-          services.push({ serviceUuid: uuid, characteristics: charInfo });
-          if (!characteristic) {
-            const found = chars.find((c) => c.properties.write || c.properties.writeWithoutResponse);
-            if (found) {
-              characteristic = found;
-              // Some cheap BLE peripherals only start acting on writes once a
-              // central has subscribed to their notify characteristic — grab
-              // the sibling notify channel from the same service, if any.
-              notifyCharacteristic = chars.find((c) => c.properties.notify || c.properties.indicate) || null;
-            }
+          const found = chars.find((c) => c.properties.write || c.properties.writeWithoutResponse);
+          if (found) {
+            characteristic = found;
+            // Some cheap BLE peripherals only start acting on writes once a
+            // central has subscribed to their notify characteristic — grab
+            // the sibling notify channel from the same service, if any.
+            notifyCharacteristic = chars.find((c) => c.properties.notify || c.properties.indicate) || null;
+            break;
           }
         } catch {
           // this device doesn't expose that service — try the next candidate
         }
       }
-      setPrinterProfile(services);
       if (!characteristic) {
         throw new Error(
           "Connected, but no writable service was found on this device."
@@ -870,7 +896,7 @@ export default function CashierApp() {
         }
       } else {
         await primeNotifications(printer.notifyCharacteristic);
-        await writeBytesToCharacteristic(printer.characteristic, buildReceiptBytes(sale, shopName, account?.email));
+        await writeBytesToCharacteristic(printer.characteristic, buildBleBytes(sale, shopName, account?.email));
       }
       setPrinterMsg({ ok: true, text: "Sent to printer." });
     } catch (err) {
@@ -900,42 +926,6 @@ export default function CashierApp() {
       change: 0,
       lines: [{ name: "Test print", qty: 1, price: 10000 }],
     });
-
-  // Diagnostic: send a test print straight to one specific characteristic,
-  // bypassing whichever one connectPrinter auto-picked. Used when the
-  // auto-picked characteristic accepts writes but never actually prints —
-  // some devices expose several writable characteristics and only one of
-  // them is wired to the print engine.
-  // Every characteristic that shares a service with `candidate` — used to
-  // find its sibling notify channel (see primeNotifications above).
-  const siblingsOf = (candidate) =>
-    printerProfile?.find((s) => s.characteristics.some((c) => c.characteristic === candidate.characteristic))
-      ?.characteristics || [];
-
-  const testCandidate = async (candidate) => {
-    setPrinterBusy(true);
-    setPrinterMsg(null);
-    try {
-      const notifyChar = siblingsOf(candidate).find((c) => c.notifiable)?.characteristic;
-      await primeNotifications(notifyChar);
-      const sale = {
-        at: Date.now(), total: 10000, paid: 10000, change: 0,
-        lines: [{ name: "Test print", qty: 1, price: 10000 }],
-      };
-      await writeBytesToCharacteristic(candidate.characteristic, buildReceiptBytes(sale, shopName, account?.email));
-      setPrinterMsg({ ok: true, text: `Sent to ${candidate.uuid.slice(0, 8)}… — check the paper.` });
-    } catch (err) {
-      setPrinterMsg({ ok: false, text: err.message || "Send failed." });
-    } finally {
-      setPrinterBusy(false);
-    }
-  };
-
-  const useCandidate = (candidate) => {
-    const notifyChar = siblingsOf(candidate).find((c) => c.notifiable)?.characteristic || null;
-    setPrinter((p) => p && { ...p, characteristic: candidate.characteristic, notifyCharacteristic: notifyChar });
-    setPrinterMsg({ ok: true, text: `Now printing via ${candidate.uuid.slice(0, 8)}….` });
-  };
 
   const printReceipt = (sale) => {
     if (printer) printToDevice(sale);
@@ -1735,14 +1725,13 @@ export default function CashierApp() {
           printer={printer}
           printerBusy={printerBusy}
           printerMsg={printerMsg}
-          printerProfile={printerProfile}
+          printerProtocol={printerProtocol}
+          onChoosePrinterProtocol={choosePrinterProtocol}
           receiptPreviewUrl={receiptPreviewUrl}
           onConnectPrinter={connectPrinter}
           onConnectSerialPrinter={connectSerialPrinter}
           onDisconnectPrinter={disconnectPrinter}
           onTestPrint={testPrint}
-          onTestCandidate={testCandidate}
-          onUseCandidate={useCandidate}
         />
       )}
 
@@ -2121,8 +2110,8 @@ function AuthScreen({ mode, setMode, hasAccount, error, onLogin, onSignup, onChe
  * ================================================================== */
 function SettingsPage({
   account, shopName, onSave, onChangePassword, onBack,
-  printer, printerBusy, printerMsg, printerProfile, receiptPreviewUrl,
-  onConnectPrinter, onConnectSerialPrinter, onDisconnectPrinter, onTestPrint, onTestCandidate, onUseCandidate,
+  printer, printerBusy, printerMsg, printerProtocol, onChoosePrinterProtocol, receiptPreviewUrl,
+  onConnectPrinter, onConnectSerialPrinter, onDisconnectPrinter, onTestPrint,
 }) {
   const [p, setP] = useState({
     username: account.username, shopName, email: account.email,
@@ -2231,51 +2220,36 @@ function SettingsPage({
             <div className="printer-status">
               <Bluetooth size={16} /> Connected to <strong>{printer.name}</strong>
             </div>
+            {printer.kind !== "serial" && (
+              <>
+                <p className="printer-note">
+                  Protocol this printer speaks — if a test print comes out as a
+                  wall of garbled repeating text instead of the receipt image,
+                  it doesn't understand the currently selected one; switch to
+                  the other and test again.
+                </p>
+                <div className="settings-actions">
+                  <button
+                    className={printerProtocol === "escpos" ? "save" : "ghost"}
+                    onClick={() => onChoosePrinterProtocol("escpos")}
+                  >
+                    ESC/POS (standard)
+                  </button>
+                  <button
+                    className={printerProtocol === "cat" ? "save" : "ghost"}
+                    onClick={() => onChoosePrinterProtocol("cat")}
+                  >
+                    Cat printer (GB01/YHK)
+                  </button>
+                </div>
+              </>
+            )}
             <div className="settings-actions">
               <button className="ghost" onClick={onDisconnectPrinter}>Disconnect</button>
               <button className="save" onClick={onTestPrint} disabled={printerBusy}>
                 {printerBusy ? "Printing…" : "Test print"}
               </button>
             </div>
-            {printer.kind !== "serial" && printerProfile && printerProfile.some((s) => s.characteristics.some((c) => c.writable)) && (
-              <div className="printer-profile">
-                <p className="printer-note">
-                  If "Test print" sends without error but nothing comes out of the
-                  printer, the wrong Bluetooth channel is probably being used —
-                  this device exposes more than one writable channel. Try each one
-                  below and watch the printer for physical output.
-                </p>
-                {printerProfile.filter((s) => s.characteristics.some((c) => c.writable)).map((s) => (
-                  <div className="printer-profile-service" key={s.serviceUuid}>
-                    <div className="printer-profile-service-id">{s.serviceUuid}</div>
-                    {s.characteristics.filter((c) => c.writable).map((c) => (
-                      <div className="printer-profile-char" key={c.uuid}>
-                        <div className="printer-profile-char-id">
-                          {c.uuid}
-                          <span className="printer-profile-props">{c.props}</span>
-                        </div>
-                        <div className="printer-profile-char-actions">
-                          <button
-                            className="ghost small"
-                            onClick={() => onTestCandidate(c)}
-                            disabled={printerBusy}
-                          >
-                            Test
-                          </button>
-                          <button
-                            className="ghost small"
-                            onClick={() => onUseCandidate(c)}
-                            disabled={printerBusy || printer.characteristic === c.characteristic}
-                          >
-                            {printer.characteristic === c.characteristic ? "In use" : "Use for printing"}
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ))}
-              </div>
-            )}
           </>
         ) : (
           <>
@@ -2822,17 +2796,6 @@ function Style() {
   background:var(--paid-soft);color:var(--paid);padding:10px 13px;border-radius:10px;margin-bottom:14px;}
 .printer-status strong{color:inherit;}
 
-.printer-profile{margin-top:16px;padding-top:14px;border-top:1px solid var(--line);}
-.printer-profile-service{margin-bottom:10px;}
-.printer-profile-service-id{font-family:var(--mono);font-size:11px;color:var(--muted);
-  margin-bottom:6px;word-break:break-all;}
-.printer-profile-char{display:flex;align-items:center;justify-content:space-between;gap:10px;
-  background:var(--paper);border:1px solid var(--line);border-radius:10px;
-  padding:9px 12px;margin-bottom:6px;}
-.printer-profile-char-id{font-family:var(--mono);font-size:11px;word-break:break-all;flex:1;min-width:0;}
-.printer-profile-props{display:block;color:var(--muted);font-size:10.5px;margin-top:2px;}
-.printer-profile-char-actions{display:flex;gap:6px;flex-shrink:0;}
-.ghost.small{height:32px;padding:0 10px;font-size:12.5px;border-radius:8px;}
 
 /* Print-only receipt for the native browser print fallback (used when no
    Bluetooth printer is connected — the only option on iOS). Hidden on
