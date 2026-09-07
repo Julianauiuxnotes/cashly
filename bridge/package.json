@@ -1,0 +1,17 @@
+{
+  "name": "cashly-print-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local server that relays receipt print jobs from any phone on the shop WiFi to the BLE thermal printer — the workaround for iPhone, which cannot reach BLE printers directly from any browser.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@abandonware/noble": "^1.9.2-16",
+    "express": "^4.19.2"
+  },
+  "allowScripts": {
+    "@abandonware/noble@1.9.2-26": true
+  }
+}

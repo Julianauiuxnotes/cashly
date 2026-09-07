@@ -453,6 +453,30 @@ async function writeBytesToCharacteristic(characteristic, bytes) {
   await new Promise((r) => setTimeout(r, 1500)); // let the buffer fully drain before we call it done
 }
 
+// Sends print bytes to the local print-bridge server instead of over Web
+// Bluetooth — the workaround for iOS, where no browser can reach a BLE
+// printer directly at all (Apple disallows the Web Bluetooth API in
+// WebKit, and every iOS browser is forced onto WebKit). The bridge is a
+// small always-on Node process on a machine with working Bluetooth to the
+// printer (see bridge/README.md); phones just need a plain HTTP fetch,
+// which every browser supports, iOS included.
+async function writeBytesToBridge(bridgeUrl, bytes) {
+  let res;
+  try {
+    res = await fetch(`${bridgeUrl.replace(/\/+$/, "")}/print`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: bytes,
+    });
+  } catch {
+    throw new Error("Couldn't reach the print bridge — check it's running and the phone is on the same WiFi.");
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.error || `Bridge print failed (${res.status}).`);
+  }
+}
+
 // A write can hang forever if the peer stops granting flow-control credit
 // (seen with this printer's RFCOMM connection on a large single write) —
 // never let a print silently freeze the UI's "Printing…" state.
@@ -566,6 +590,18 @@ export default function CashierApp() {
     try { window.localStorage.setItem(STORAGE_PREFIX + "printerProtocol", v); } catch { /* ignore */ }
   };
   const buildBleBytes = printerProtocol === "escpos" ? buildEscPosBytes : buildReceiptBytes;
+
+  // URL of the local print-bridge server (see bridge/README.md) — the path
+  // that lets iPhone print, since iOS bans in-browser Bluetooth entirely.
+  // Remembered per-browser: a phone on the shop's WiFi always reaches the
+  // same bridge.
+  const [bridgeUrl, setBridgeUrl] = useState(
+    () => window.localStorage.getItem(STORAGE_PREFIX + "bridgeUrl") || ""
+  );
+  const saveBridgeUrl = (v) => {
+    setBridgeUrl(v);
+    try { window.localStorage.setItem(STORAGE_PREFIX + "bridgeUrl", v); } catch { /* ignore */ }
+  };
 
   const [itemForm, setItemForm] = useState(null); // {mode, id, name, price, category}
   const [confirmDelete, setConfirmDelete] = useState(null);
@@ -858,6 +894,36 @@ export default function CashierApp() {
     }
   };
 
+  // Connects via the local print bridge instead of an in-browser Bluetooth
+  // API — works on any browser, iOS Safari included, since it's just a
+  // plain HTTP request. Confirms the bridge is actually reachable (and has
+  // a printer of its own attached) before treating it as "connected".
+  const connectBridgePrinter = async () => {
+    const url = bridgeUrl.trim().replace(/\/+$/, "");
+    if (!url) {
+      setPrinterMsg({ ok: false, text: "Enter the print bridge's address first." });
+      return;
+    }
+    setPrinterBusy(true);
+    setPrinterMsg(null);
+    try {
+      const res = await fetch(`${url}/health`);
+      if (!res.ok) throw new Error(`Bridge responded with ${res.status}.`);
+      const health = await res.json();
+      saveBridgeUrl(url);
+      setPrinter({ kind: "bridge", url, name: health.printerName || "Bridge printer" });
+      setPrinterMsg(
+        health.printerConnected
+          ? { ok: true, text: `Connected via bridge (${health.printerName}).` }
+          : { ok: false, text: "Bridge reachable, but it has no printer connected yet." }
+      );
+    } catch {
+      setPrinterMsg({ ok: false, text: "Couldn't reach the print bridge — check the address and that it's running." });
+    } finally {
+      setPrinterBusy(false);
+    }
+  };
+
   const disconnectPrinter = () => {
     if (printer?.kind === "serial") {
       try { printer.reader.cancel(); printer.reader.releaseLock(); } catch { /* already released/broken */ }
@@ -894,6 +960,8 @@ export default function CashierApp() {
           await writeBytesToSerial(printer.writer, step);
           await new Promise((r) => setTimeout(r, 500));
         }
+      } else if (printer.kind === "bridge") {
+        await writeBytesToBridge(printer.url, buildBleBytes(sale, shopName, account?.email));
       } else {
         await primeNotifications(printer.notifyCharacteristic);
         await writeBytesToCharacteristic(printer.characteristic, buildBleBytes(sale, shopName, account?.email));
@@ -1727,9 +1795,12 @@ export default function CashierApp() {
           printerMsg={printerMsg}
           printerProtocol={printerProtocol}
           onChoosePrinterProtocol={choosePrinterProtocol}
+          bridgeUrl={bridgeUrl}
+          onBridgeUrlChange={setBridgeUrl}
           receiptPreviewUrl={receiptPreviewUrl}
           onConnectPrinter={connectPrinter}
           onConnectSerialPrinter={connectSerialPrinter}
+          onConnectBridgePrinter={connectBridgePrinter}
           onDisconnectPrinter={disconnectPrinter}
           onTestPrint={testPrint}
         />
@@ -2110,8 +2181,9 @@ function AuthScreen({ mode, setMode, hasAccount, error, onLogin, onSignup, onChe
  * ================================================================== */
 function SettingsPage({
   account, shopName, onSave, onChangePassword, onBack,
-  printer, printerBusy, printerMsg, printerProtocol, onChoosePrinterProtocol, receiptPreviewUrl,
-  onConnectPrinter, onConnectSerialPrinter, onDisconnectPrinter, onTestPrint,
+  printer, printerBusy, printerMsg, printerProtocol, onChoosePrinterProtocol,
+  bridgeUrl, onBridgeUrlChange, receiptPreviewUrl,
+  onConnectPrinter, onConnectSerialPrinter, onConnectBridgePrinter, onDisconnectPrinter, onTestPrint,
 }) {
   const [p, setP] = useState({
     username: account.username, shopName, email: account.email,
@@ -2207,18 +2279,21 @@ function SettingsPage({
             <span className="receipt-preview-label">Preview — sample data, your shop's real name/email</span>
           </div>
         )}
-        {!bluetoothSupported && !serialSupported ? (
+        {!bluetoothSupported && !serialSupported && (
           <p className="printer-note">
-            In-browser printer connections aren't available in this browser —
-            no browser on iPhone/iPad supports them, since Apple doesn't
-            allow it in iOS WebKit. Use the "Print receipt" button after a
-            sale instead; it opens your device's print dialog, which can
-            print via AirPrint or any printer set up on this device.
+            This browser can't connect to Bluetooth printers directly — every
+            iPhone/iPad browser is affected, since Apple doesn't allow it in
+            iOS WebKit. Use the print bridge below instead (it works on any
+            device); or the "Print receipt" button after a sale, which opens
+            this device's own print dialog and can print via AirPrint.
           </p>
-        ) : printer ? (
+        )}
+        {printer ? (
           <>
             <div className="printer-status">
-              <Bluetooth size={16} /> Connected to <strong>{printer.name}</strong>
+              {printer.kind === "bridge" ? <Printer size={16} /> : <Bluetooth size={16} />} Connected to{" "}
+              <strong>{printer.name}</strong>
+              {printer.kind === "bridge" && " (via bridge)"}
             </div>
             {printer.kind !== "serial" && (
               <>
@@ -2253,17 +2328,41 @@ function SettingsPage({
           </>
         ) : (
           <>
+            {bluetoothSupported && (
+              <>
+                <p className="printer-note">
+                  Pair a Bluetooth thermal receipt printer to print straight
+                  from this browser.
+                </p>
+                <div className="settings-actions">
+                  <button className="save" onClick={onConnectPrinter} disabled={printerBusy}>
+                    <Bluetooth size={16} /> {printerBusy ? "Connecting…" : "Connect printer"}
+                  </button>
+                </div>
+              </>
+            )}
+
             <p className="printer-note">
-              Pair a Bluetooth thermal receipt printer to print straight from
-              this browser.
+              Or connect through the print bridge — a small always-on server
+              on a computer already paired with the printer. Works from any
+              phone on the same WiFi, iPhone included. See{" "}
+              <code>bridge/README.md</code> in the project for setup.
             </p>
-            <div className="settings-actions">
-              {bluetoothSupported && (
-                <button className="save" onClick={onConnectPrinter} disabled={printerBusy}>
-                  <Bluetooth size={16} /> {printerBusy ? "Connecting…" : "Connect printer"}
-                </button>
-              )}
+            <div className="icon-input">
+              <Printer size={16} />
+              <input
+                placeholder="http://192.168.1.23:8787"
+                value={bridgeUrl}
+                onChange={(e) => onBridgeUrlChange(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && onConnectBridgePrinter()}
+              />
             </div>
+            <div className="settings-actions">
+              <button className="save" onClick={onConnectBridgePrinter} disabled={printerBusy || !bridgeUrl.trim()}>
+                {printerBusy ? "Connecting…" : "Connect to bridge"}
+              </button>
+            </div>
+
             {serialSupported && (
               <>
                 <p className="printer-note">
