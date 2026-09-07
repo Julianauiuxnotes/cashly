@@ -4,7 +4,7 @@ import {
   Package, Store, Receipt, Wallet, ArrowLeft, ChevronRight, ChevronDown,
   LayoutDashboard, TrendingUp, Clock, CheckCircle2, MoreVertical,
   Settings, LogOut, User, Mail, Lock, ArrowRight, CircleArrowRight, Eye, EyeOff,
-  BarChart3, GripVertical, Bluetooth, Printer,
+  BarChart3, GripVertical, Bluetooth, Printer, Download,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ *
@@ -1000,6 +1000,24 @@ export default function CashierApp() {
     else window.print();
   };
 
+  // Saves the receipt as a PNG image — for iPhone, where no browser can
+  // reach the printer directly (Apple bans Web Bluetooth in iOS WebKit) and
+  // there's no print bridge available: the image can be shared into a
+  // third-party "Bluetooth thermal printer" app instead, which prints over
+  // Bluetooth using its own native access, unaffected by that restriction.
+  const downloadReceipt = (sale) => {
+    const canvas = renderReceiptCanvas(sale, shopName, account?.email);
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.download = `receipt-${sale.orderNo ?? sale.id}.png`;
+      link.href = url;
+      link.click();
+      URL.revokeObjectURL(url);
+    }, "image/png");
+  };
+
   // Prints any past order: a connected printer goes straight through, the
   // browser fallback first stages the sale into the hidden receipt DOM
   // (below) and waits for that render to commit before opening the print
@@ -1369,6 +1387,9 @@ export default function CashierApp() {
                           >
                             <Printer size={15} />
                             {printerBusy ? "Printing…" : printer ? "Print receipt" : "Print receipt (browser)"}
+                          </button>
+                          <button className="txn-print-btn ghost" onClick={() => downloadReceipt(s)}>
+                            <Download size={15} /> Download receipt
                           </button>
                           {isOpen && printerMsg && (
                             <div className={"pw-msg" + (printerMsg.ok ? " ok" : " err")}>{printerMsg.text}</div>
@@ -1872,6 +1893,9 @@ export default function CashierApp() {
             <button className="new-order print-btn" onClick={() => printReceipt(success)} disabled={printerBusy}>
               <Printer size={16} />
               {printerBusy ? "Printing…" : printer ? "Print receipt" : "Print receipt (browser)"}
+            </button>
+            <button className="new-order print-btn ghost" onClick={() => downloadReceipt(success)}>
+              <Download size={16} /> Download receipt
             </button>
             {printerMsg && (
               <div className={"pw-msg" + (printerMsg.ok ? " ok" : " err")}>{printerMsg.text}</div>
