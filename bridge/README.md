@@ -86,3 +86,76 @@ PORT=9000 npm start
 
 Whatever machine runs this needs to (a) stay on and awake during opening
 hours, and (b) stay within Bluetooth range of the printer.
+
+## Running unattended on a Raspberry Pi
+
+If no laptop will be at the shop, a small always-on board works instead —
+this is the recommended way to run the bridge day-to-day, rather than
+relying on a Mac that needs to stay open.
+
+**Board:** get a **Raspberry Pi Zero 2 W**, not the original Pi Zero W. Both
+have Bluetooth, but the original's armv6 CPU has much weaker prebuilt-binary
+support for the native Bluetooth module this bridge depends on
+(`@abandonware/noble`) — the Zero 2 W's armv7/aarch64 CPU avoids that
+entirely. A Pi 3/4/5 also works fine if you already have one spare.
+
+**1. Flash the OS.** Use Raspberry Pi Imager. Pick **Raspberry Pi OS Lite**
+(no desktop needed). In the imager's settings (gear icon / advanced
+options) before writing: enable SSH, set a username/password, and enter
+your shop's WiFi SSID/password — this gets you a headless setup with no
+monitor or keyboard needed.
+
+**2. SSH in and install Node + build tools:**
+
+```
+ssh <username>@raspberrypi.local
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs build-essential python3 libbluetooth-dev bluez
+```
+
+(The apt-provided Node on Raspberry Pi OS is often too old — NodeSource's
+setup script above installs a current one instead.)
+
+**3. Get the code onto the Pi** — either `git clone` the repo, or `scp -r`
+the project from your Mac, then:
+
+```
+cd cashly
+npm run build
+cd bridge
+npm install
+```
+
+**4. Let Node use Bluetooth without running as root:**
+
+```
+sudo setcap cap_net_raw+eip $(eval readlink -f `which node`)
+```
+
+Without this, noble needs the whole process running as root to open a raw
+Bluetooth socket — the systemd service below assumes you've run this step
+(it grants the capability directly instead).
+
+**5. Auto-start on boot**, so a power cut or reboot doesn't require SSHing
+back in: copy `bridge/cashly-bridge.service` to the Pi, edit
+`WorkingDirectory`/`User` if your paths or username differ, then:
+
+```
+sudo cp cashly-bridge.service /etc/systemd/system/
+sudo systemctl enable --now cashly-bridge
+```
+
+Check it's running with `systemctl status cashly-bridge` and
+`journalctl -u cashly-bridge -f` for live logs (same output you'd see from
+`npm start` directly).
+
+**6. Find its address.** Raspberry Pi OS broadcasts an mDNS hostname by
+default, so `http://raspberrypi.local:8787/cashly/` should work from any
+phone on the same WiFi without needing to look up its IP. If you're running
+more than one Pi on the network, give this one a distinct hostname first
+(`sudo raspi-config` → System Options → Hostname, e.g. `cashly-bridge`),
+then use `http://cashly-bridge.local:8787/cashly/` instead.
+
+This setup is untested against your actual hardware — if something in it
+doesn't match reality once you have the Pi in hand, that's expected; treat
+it as a starting point to debug from rather than an exact script.

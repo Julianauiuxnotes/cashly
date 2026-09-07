@@ -1,0 +1,19 @@
+[Unit]
+Description=Cashly print bridge
+After=network-online.target bluetooth.target
+Wants=network-online.target
+
+[Service]
+# Adjust this path if the repo lives somewhere other than the pi user's home.
+WorkingDirectory=/home/pi/cashly/bridge
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+User=pi
+# Lets Node open a raw Bluetooth socket without running the whole service as
+# root — see the setcap step in bridge/README.md. If you skip that step,
+# remove this line and set User=root instead.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
