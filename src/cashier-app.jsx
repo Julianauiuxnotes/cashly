@@ -4,7 +4,7 @@ import {
   Package, Store, Receipt, Wallet, ArrowLeft, ChevronRight, ChevronDown,
   LayoutDashboard, TrendingUp, Clock, CheckCircle2, MoreVertical,
   Settings, LogOut, User, Mail, Lock, ArrowRight, CircleArrowRight, Eye, EyeOff,
-  BarChart3, GripVertical, Bluetooth, Printer, Download,
+  BarChart3, GripVertical, Bluetooth, Printer, Share2,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ *
@@ -1002,16 +1002,33 @@ export default function CashierApp() {
 
   // Saves the receipt as a PNG image — for iPhone, where no browser can
   // reach the printer directly (Apple bans Web Bluetooth in iOS WebKit) and
-  // there's no print bridge available: the image can be shared into a
-  // third-party "Bluetooth thermal printer" app instead, which prints over
-  // Bluetooth using its own native access, unaffected by that restriction.
+  // there's no print bridge available: the image can be saved to Photos, or
+  // shared straight into a third-party "Bluetooth thermal printer" app
+  // instead, which prints over Bluetooth using its own native access,
+  // unaffected by that restriction.
+  //
+  // Prefers the Web Share API (with a file attached) where available — on
+  // iOS/Android this opens the native share sheet, which has "Save Image"
+  // (straight to Photos) built in as one of the destinations, alongside
+  // whatever printer/other apps are installed. Falls back to a plain file
+  // download where share-with-files isn't supported (desktop browsers).
   const downloadReceipt = (sale) => {
     const canvas = renderReceiptCanvas(sale, shopName, account?.email);
-    canvas.toBlob((blob) => {
+    canvas.toBlob(async (blob) => {
       if (!blob) return;
+      const filename = `receipt-${sale.orderNo ?? sale.id}.png`;
+      const file = new File([blob], filename, { type: "image/png" });
+      if (navigator.canShare?.({ files: [file] })) {
+        try {
+          await navigator.share({ files: [file] });
+        } catch {
+          // user backed out of the share sheet — nothing further to do
+        }
+        return;
+      }
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
-      link.download = `receipt-${sale.orderNo ?? sale.id}.png`;
+      link.download = filename;
       link.href = url;
       link.click();
       URL.revokeObjectURL(url);
@@ -1389,7 +1406,7 @@ export default function CashierApp() {
                             {printerBusy ? "Printing…" : printer ? "Print receipt" : "Print receipt (browser)"}
                           </button>
                           <button className="txn-print-btn ghost" onClick={() => downloadReceipt(s)}>
-                            <Download size={15} /> Download receipt
+                            <Share2 size={15} /> Save / share receipt
                           </button>
                           {isOpen && printerMsg && (
                             <div className={"pw-msg" + (printerMsg.ok ? " ok" : " err")}>{printerMsg.text}</div>
@@ -1895,7 +1912,7 @@ export default function CashierApp() {
               {printerBusy ? "Printing…" : printer ? "Print receipt" : "Print receipt (browser)"}
             </button>
             <button className="new-order print-btn ghost" onClick={() => downloadReceipt(success)}>
-              <Download size={16} /> Download receipt
+              <Share2 size={16} /> Save / share receipt
             </button>
             {printerMsg && (
               <div className={"pw-msg" + (printerMsg.ok ? " ok" : " err")}>{printerMsg.text}</div>
