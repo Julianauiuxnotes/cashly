@@ -4,7 +4,8 @@ import {
   Package, Store, Receipt, Wallet, ArrowLeft, ChevronRight, ChevronDown,
   LayoutDashboard, TrendingUp, Clock, CheckCircle2, MoreVertical,
   Settings, LogOut, User, Mail, Lock, ArrowRight, CircleArrowRight, Eye, EyeOff,
-  BarChart3, GripVertical, Bluetooth, Printer, Share2,
+  BarChart3, GripVertical, Bluetooth, Printer, Share2, Phone, Upload,
+  Image as ImageIcon,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ *
@@ -62,6 +63,32 @@ function playChaChing() {
     });
     setTimeout(() => ctx.close(), 700);
   } catch (e) { /* audio unavailable — silently skip */ }
+}
+
+// Downscales an uploaded logo file to a data URL capped at maxWidth — a
+// receipt printed on a 384-dot thermal head can't resolve more detail than
+// that anyway, and localStorage has limited room for base64 image data.
+function readImageAsResizedDataUrl(file, maxWidth = 300) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Couldn't read that image."));
+      img.onload = () => {
+        const scale = Math.min(1, maxWidth / img.width);
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/png"));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 const rp = (n) => {
@@ -151,15 +178,27 @@ const fitText = (ctx, text, maxWidth) => {
   return t + "…";
 };
 
-function renderReceiptCanvas(sale, shopName, email) {
+function renderReceiptCanvas(sale, shopName, email, phone, logoImg) {
   const W = RASTER_DOTS;
   const pad = 14;
   const rowH = 22;
   const lines = sale.lines || [];
   const estRows = 6 + lines.length * 2 + 6 + (sale.paid != null ? 1 : 0) + (sale.change > 0 ? 1 : 0);
+
+  // Fit the logo into a bounding box (full receipt width, capped height),
+  // preserving aspect ratio — printing it any larger wastes paper and dots
+  // a 384-wide thermal head can't resolve anyway.
+  let logoW = 0, logoH = 0;
+  if (logoImg) {
+    const boxW = W - pad * 2, boxH = 80;
+    const scale = Math.min(boxW / logoImg.width, boxH / logoImg.height);
+    logoW = Math.round(logoImg.width * scale);
+    logoH = Math.round(logoImg.height * scale);
+  }
+
   const canvas = document.createElement("canvas");
   canvas.width = W;
-  canvas.height = estRows * rowH + pad * 2;
+  canvas.height = estRows * rowH + pad * 2 + (logoImg ? logoH + 10 : 0);
   const ctx = canvas.getContext("2d");
   ctx.fillStyle = "#fff";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -187,8 +226,13 @@ function renderReceiptCanvas(sale, shopName, email) {
     ctx.fillText(right, W - pad - rw, y);
   };
 
+  if (logoImg) {
+    ctx.drawImage(logoImg, (W - logoW) / 2, y, logoW, logoH);
+    y += logoH + 10;
+  }
   center(shopName || "My Shop", "bold 22px sans-serif"); y += rowH + 2;
   if (email) { center(`Shop email : ${email}`, "14px monospace"); y += rowH - 6; }
+  if (phone) { center(`Tel : ${phone}`, "14px monospace"); y += rowH - 6; }
   center(new Date(sale.at || Date.now()).toLocaleString("id-ID"), "13px monospace"); y += rowH;
   hr(false); y += 16;
 
@@ -275,8 +319,8 @@ function canvasToRasterRotated(canvas) {
 // one is sent as its own write with a pause after, mirroring the working
 // reference client exactly (this firmware appears to need the breathing
 // room between init / start-print / image / feed).
-function buildYhkPrintSteps(sale, shopName, email) {
-  const canvas = renderReceiptCanvas(sale, shopName, email);
+function buildYhkPrintSteps(sale, shopName, email, phone, logoImg) {
+  const canvas = renderReceiptCanvas(sale, shopName, email, phone, logoImg);
   const { bytesPerRow, height, raster } = canvasToRasterRotated(canvas);
   const imageCmd = new Uint8Array([
     0x1d, 0x76, 0x30, 0x00,
@@ -377,8 +421,8 @@ const catPrintRow = (row) => {
   return catCmd(0xbf, rle); // run-length compressed
 };
 
-function buildReceiptBytes(sale, shopName, email) {
-  const rows = canvasToRows(renderReceiptCanvas(sale, shopName, email));
+function buildReceiptBytes(sale, shopName, email, phone, logoImg) {
+  const rows = canvasToRows(renderReceiptCanvas(sale, shopName, email, phone, logoImg));
   const bytes = [
     ...CAT_GET_DEV_STATE,
     ...CAT_SET_QUALITY_200_DPI,
@@ -425,8 +469,8 @@ function canvasToRaster(canvas) {
 const ESC_INIT = new Uint8Array([0x1b, 0x40]); // ESC @ — reset to defaults
 const ESC_FEED = new Uint8Array([0x0a, 0x0a, 0x0a, 0x0a]); // feed past the cutter
 
-function buildEscPosBytes(sale, shopName, email) {
-  const canvas = renderReceiptCanvas(sale, shopName, email);
+function buildEscPosBytes(sale, shopName, email, phone, logoImg) {
+  const canvas = renderReceiptCanvas(sale, shopName, email, phone, logoImg);
   const { bytesPerRow, height, raster } = canvasToRaster(canvas);
   const imageCmd = new Uint8Array([
     0x1d, 0x76, 0x30, 0x00, // GS v 0 — print raster image, normal orientation
@@ -561,7 +605,20 @@ export default function CashierApp() {
   const [ready, setReady] = useState(false);
   const [view, setView] = useState("cashier"); // 'cashier' | 'items'
   const [shopName, setShopName] = useState("My Shop");
+  const [shopPhone, setShopPhone] = useState("");
+  const [shopLogo, setShopLogo] = useState(null); // data URL, or null
   const [editingName, setEditingName] = useState(false);
+
+  // The receipt canvas needs an already-loaded Image to draw synchronously
+  // — this re-decodes shopLogo (a plain data URL string) into one whenever
+  // it changes, rather than every print/preview call doing its own async load.
+  const [shopLogoImg, setShopLogoImg] = useState(null);
+  useEffect(() => {
+    if (!shopLogo) { setShopLogoImg(null); return; }
+    const img = new Image();
+    img.onload = () => setShopLogoImg(img);
+    img.src = shopLogo;
+  }, [shopLogo]);
 
   const [items, setItems] = useState([]);
   const [sales, setSales] = useState([]);
@@ -623,10 +680,14 @@ export default function CashierApp() {
       const savedItems = await store.get("items", null);
       const savedSales = await store.get("sales", []);
       const savedName = await store.get("shopName", "My Shop");
+      const savedPhone = await store.get("shopPhone", "");
+      const savedLogo = await store.get("shopLogo", null);
       setItems(savedItems && savedItems.length ? savedItems : SEED_ITEMS);
       if (!savedItems) await store.set("items", SEED_ITEMS);
       setSales(numberSales(savedSales || []));
       setShopName(savedName || "My Shop");
+      setShopPhone(savedPhone || "");
+      setShopLogo(savedLogo || null);
       const savedAccount = await store.get("account", null);
       const savedSession = await store.get("session", false);
       setAccount(savedAccount);
@@ -640,6 +701,8 @@ export default function CashierApp() {
   useEffect(() => { if (ready) store.set("items", items); }, [items, ready]);
   useEffect(() => { if (ready) store.set("sales", sales); }, [sales, ready]);
   useEffect(() => { if (ready) store.set("shopName", shopName); }, [shopName, ready]);
+  useEffect(() => { if (ready) store.set("shopPhone", shopPhone); }, [shopPhone, ready]);
+  useEffect(() => { if (ready) store.set("shopLogo", shopLogo); }, [shopLogo, ready]);
   useEffect(() => { if (ready) store.set("account", account); }, [account, ready]);
   useEffect(() => { if (ready) store.set("session", authed); }, [authed, ready]);
 
@@ -677,8 +740,8 @@ export default function CashierApp() {
         { name: "Es Teh Manis", qty: 1, price: 5000 },
       ],
     };
-    return renderReceiptCanvas(sample, shopName, account?.email).toDataURL();
-  }, [shopName, account?.email]);
+    return renderReceiptCanvas(sample, shopName, account?.email, shopPhone, shopLogoImg).toDataURL();
+  }, [shopName, account?.email, shopPhone, shopLogoImg]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -956,15 +1019,15 @@ export default function CashierApp() {
     try {
       if (printer.kind === "serial") {
         await yhkHandshake(printer.writer, printer.reader);
-        for (const step of buildYhkPrintSteps(sale, shopName, account?.email)) {
+        for (const step of buildYhkPrintSteps(sale, shopName, account?.email, shopPhone, shopLogoImg)) {
           await writeBytesToSerial(printer.writer, step);
           await new Promise((r) => setTimeout(r, 500));
         }
       } else if (printer.kind === "bridge") {
-        await writeBytesToBridge(printer.url, buildBleBytes(sale, shopName, account?.email));
+        await writeBytesToBridge(printer.url, buildBleBytes(sale, shopName, account?.email, shopPhone, shopLogoImg));
       } else {
         await primeNotifications(printer.notifyCharacteristic);
-        await writeBytesToCharacteristic(printer.characteristic, buildBleBytes(sale, shopName, account?.email));
+        await writeBytesToCharacteristic(printer.characteristic, buildBleBytes(sale, shopName, account?.email, shopPhone, shopLogoImg));
       }
       setPrinterMsg({ ok: true, text: "Sent to printer." });
     } catch (err) {
@@ -1013,7 +1076,7 @@ export default function CashierApp() {
   // whatever printer/other apps are installed. Falls back to a plain file
   // download where share-with-files isn't supported (desktop browsers).
   const downloadReceipt = (sale) => {
-    const canvas = renderReceiptCanvas(sale, shopName, account?.email);
+    const canvas = renderReceiptCanvas(sale, shopName, account?.email, shopPhone, shopLogoImg);
     canvas.toBlob(async (blob) => {
       if (!blob) return;
       const filename = `receipt-${sale.orderNo ?? sale.id}.png`;
@@ -1162,6 +1225,8 @@ export default function CashierApp() {
   const saveProfile = (p) => {
     setAccount((a) => ({ ...a, username: p.username.trim(), email: p.email.trim() }));
     setShopName(p.shopName.trim());
+    setShopPhone(p.shopPhone.trim());
+    setShopLogo(p.shopLogo || null);
   };
   const changePassword = (cur, next) => {
     if (cur !== account.password) return "Current password is incorrect.";
@@ -1825,6 +1890,8 @@ export default function CashierApp() {
         <SettingsPage
           account={account}
           shopName={shopName}
+          shopPhone={shopPhone}
+          shopLogo={shopLogo}
           onSave={saveProfile}
           onChangePassword={changePassword}
           onBack={() => setView("dashboard")}
@@ -1931,8 +1998,10 @@ export default function CashierApp() {
         const qty = (r.lines || []).reduce((a, l) => a + l.qty, 0);
         return (
           <div className="print-receipt">
+            {shopLogo && <img className="pr-shop-logo" src={shopLogo} alt="" />}
             <h4>{shopName}</h4>
             {account?.email && <div className="pr-email">Shop email : {account.email}</div>}
+            {shopPhone && <div className="pr-email">Tel : {shopPhone}</div>}
             <div className="pr-meta">{new Date(r.at || Date.now()).toLocaleString("id-ID")}</div>
             <hr className="pr-hr" />
             {(r.lines || []).map((l, i) => (
@@ -2221,26 +2290,42 @@ function AuthScreen({ mode, setMode, hasAccount, error, onLogin, onSignup, onChe
  * Settings page — edit profile + change password.
  * ================================================================== */
 function SettingsPage({
-  account, shopName, onSave, onChangePassword, onBack,
+  account, shopName, shopPhone, shopLogo, onSave, onChangePassword, onBack,
   printer, printerBusy, printerMsg, printerProtocol, onChoosePrinterProtocol,
   bridgeUrl, onBridgeUrlChange, receiptPreviewUrl,
   onConnectPrinter, onConnectSerialPrinter, onConnectBridgePrinter, onDisconnectPrinter, onTestPrint,
 }) {
   const [p, setP] = useState({
     username: account.username, shopName, email: account.email,
+    shopPhone: shopPhone || "", shopLogo: shopLogo || null,
   });
   const [pw, setPw] = useState({ current: "", next: "", confirm: "" });
   const [saved, setSaved] = useState(false);
   const [pwMsg, setPwMsg] = useState(null); // {ok, text}
+  const [logoError, setLogoError] = useState(null);
 
   const dirty =
-    p.username !== account.username || p.email !== account.email || p.shopName !== shopName;
+    p.username !== account.username || p.email !== account.email || p.shopName !== shopName ||
+    p.shopPhone !== (shopPhone || "") || p.shopLogo !== shopLogo;
 
   const saveProfile = () => {
     if (!p.username.trim() || !p.shopName.trim() || !p.email.trim()) return;
     onSave(p);
     setSaved(true);
     setTimeout(() => setSaved(false), 2200);
+  };
+
+  const onLogoFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file later
+    if (!file) return;
+    setLogoError(null);
+    try {
+      const dataUrl = await readImageAsResizedDataUrl(file);
+      setP((cur) => ({ ...cur, shopLogo: dataUrl }));
+    } catch {
+      setLogoError("Couldn't read that image — try a different file.");
+    }
   };
   const submitPw = () => {
     if (pw.next !== pw.confirm)
@@ -2275,6 +2360,37 @@ function SettingsPage({
           <Mail size={16} />
           <input type="email" value={p.email} onChange={(e) => setP({ ...p, email: e.target.value })} />
         </div>
+        <label className="field-label">Shop phone (optional)</label>
+        <div className="icon-input">
+          <Phone size={16} />
+          <input
+            type="tel"
+            placeholder="e.g. 0812-3456-7890"
+            value={p.shopPhone}
+            onChange={(e) => setP({ ...p, shopPhone: e.target.value })}
+          />
+        </div>
+        <label className="field-label">Shop logo (optional)</label>
+        <div className="logo-row">
+          {p.shopLogo ? (
+            <img className="logo-preview" src={p.shopLogo} alt="Shop logo" />
+          ) : (
+            <div className="logo-preview logo-preview-empty"><ImageIcon size={20} /></div>
+          )}
+          <div className="logo-row-actions">
+            <label className="ghost logo-upload-btn">
+              <Upload size={14} /> {p.shopLogo ? "Change" : "Upload"}
+              <input type="file" accept="image/*" onChange={onLogoFile} hidden />
+            </label>
+            {p.shopLogo && (
+              <button className="ghost logo-upload-btn" onClick={() => setP({ ...p, shopLogo: null })}>
+                <Trash2 size={14} /> Remove
+              </button>
+            )}
+          </div>
+        </div>
+        {logoError && <div className="pw-msg err">{logoError}</div>}
+        <p className="printer-note">Shown at the top of every printed/downloaded receipt.</p>
         <div className="settings-actions">
           {saved && <span className="saved-tag"><Check size={14} /> Saved</span>}
           <button className="save" onClick={saveProfile} disabled={!dirty}>Save changes</button>
@@ -2884,6 +3000,13 @@ function Style() {
 .icon-input input{flex:1;border:none;outline:none;background:none;font-size:15px;
   color:var(--ink);}
 .icon-input input::placeholder{color:#9aa2b2;}
+.logo-row{display:flex;align-items:center;gap:14px;margin-top:2px;}
+.logo-preview{width:60px;height:60px;border-radius:10px;border:1px solid var(--line);
+  object-fit:contain;background:var(--paper);flex-shrink:0;}
+.logo-preview-empty{display:flex;align-items:center;justify-content:center;color:var(--muted);}
+.logo-row-actions{display:flex;gap:8px;}
+.logo-upload-btn{display:flex;align-items:center;gap:6px;height:36px;padding:0 12px;
+  border-radius:9px;font-size:13px;font-weight:600;cursor:pointer;}
 .pw-toggle{display:flex;align-items:center;background:none;border:none;padding:0;
   color:var(--muted);cursor:pointer;flex-shrink:0;}
 .pw-toggle:hover{color:var(--ink);}
@@ -2948,6 +3071,7 @@ function Style() {
   .print-receipt{display:block;position:absolute;top:0;left:0;width:58mm;
     box-sizing:border-box;padding:3mm;font-family:var(--mono);font-size:9.5px;color:#000;
     text-align:left;}
+  .print-receipt .pr-shop-logo{display:block;max-width:32mm;max-height:16mm;margin:0 auto 2mm;}
   .print-receipt h4{margin:0;font-size:13px;font-weight:700;text-align:center;}
   .print-receipt .pr-email{font-size:8.5px;text-align:center;margin-top:2px;}
   .print-receipt .pr-meta{font-size:8px;color:#555;text-align:center;margin-top:2px;}
