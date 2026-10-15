@@ -744,6 +744,15 @@ export default function CashierApp() {
     return renderReceiptCanvas(sample, shopName, account?.email, shopPhone, shopLogoImg).toDataURL();
   }, [shopName, account?.email, shopPhone, shopLogoImg]);
 
+  // Full-size receipt bitmap for the mobile receipt page.
+  const receiptViewUrl = useMemo(
+    () =>
+      receiptView
+        ? renderReceiptCanvas(receiptView, shopName, account?.email, shopPhone, shopLogoImg).toDataURL()
+        : null,
+    [receiptView, shopName, account?.email, shopPhone, shopLogoImg]
+  );
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return items;
@@ -859,13 +868,11 @@ export default function CashierApp() {
       change: Math.max(0, change),
       lines: lines.map((l) => ({ name: l.name, price: l.price, qty: l.qty })),
     };
-    setSales((s) => {
-      const today = new Date(sale.at).toDateString();
-      const nextNo = s
-        .filter((x) => new Date(x.at).toDateString() === today)
-        .reduce((m, x) => Math.max(m, x.orderNo || 0), 0) + 1;
-      return [{ ...sale, orderNo: nextNo }, ...s].slice(0, 200);
-    });
+    const todayStr = new Date(sale.at).toDateString();
+    sale.orderNo = sales
+      .filter((x) => new Date(x.at).toDateString() === todayStr)
+      .reduce((m, x) => Math.max(m, x.orderNo || 0), 0) + 1;
+    setSales((s) => [sale, ...s].slice(0, 200));
     setSuccess(sale);
     setPrinterMsg(null);
     playChaChing();
@@ -1886,6 +1893,32 @@ export default function CashierApp() {
         </main>
       )}
 
+      {/* ---------- RECEIPT (mobile) ---------- */}
+      {view === "receipt" && receiptView && (
+        <main className="receipt-page">
+          <button className="back-link" onClick={() => setView("cashier")}>
+            <ArrowLeft size={16} /> Back to Add Order
+          </button>
+          <h2 className="receipt-page-title">
+            Receipt
+            {receiptView.orderNo != null && (
+              <span> · Order #{String(receiptView.orderNo).padStart(3, "0")}</span>
+            )}
+          </h2>
+          <div className="receipt-page-paper">
+            <img src={receiptViewUrl} alt="Receipt" />
+          </div>
+          <div className="receipt-page-actions">
+            <button className="outline-btn" onClick={() => downloadReceipt(receiptView)}>
+              <Share2 size={16} /> Save / share receipt
+            </button>
+            <button className="new-order" onClick={() => setView("cashier")}>
+              Done
+            </button>
+          </div>
+        </main>
+      )}
+
       {/* ---------- SETTINGS ---------- */}
       {view === "settings" && account && (
         <SettingsPage
@@ -1980,7 +2013,14 @@ export default function CashierApp() {
                 <Printer size={16} />
                 {printerBusy ? "Printing…" : printer ? "Print receipt" : "Print receipt (browser)"}
               </button>
-              <button className="outline-btn" onClick={() => setReceiptView(success)}>
+              <button
+                className="outline-btn"
+                onClick={() => {
+                  setReceiptView(success);
+                  setSuccess(null);
+                  setView("receipt");
+                }}
+              >
                 <Receipt size={16} /> Print receipt (mobile)
               </button>
               <button className="outline-btn" onClick={() => downloadReceipt(success)}>
@@ -1998,29 +2038,6 @@ export default function CashierApp() {
               }}
             >
               Close
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ---------- on-screen receipt (mobile) ---------- */}
-      {receiptView && (
-        <div className="scrim" onClick={() => setReceiptView(null)}>
-          <div className="modal receipt-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              <h3>Receipt</h3>
-              <button onClick={() => setReceiptView(null)}>
-                <X size={18} />
-              </button>
-            </div>
-            <div className="receipt-modal-body">
-              <img
-                src={renderReceiptCanvas(receiptView, shopName, account?.email, shopPhone, shopLogoImg).toDataURL()}
-                alt="Receipt"
-              />
-            </div>
-            <button className="new-order receipt-done" onClick={() => setReceiptView(null)}>
-              Done
             </button>
           </div>
         </div>
@@ -2626,7 +2643,8 @@ function Style() {
   min-height:100vh; -webkit-font-smoothing:antialiased;
 }
 .pos-root *{box-sizing:border-box;}
-.pos-root button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit;}
+/* :where() keeps this reset at zero class-specificity so any button class style overrides it */
+:where(.pos-root) button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit;}
 .pos-root input{font-family:inherit;color:inherit;}
 .loading{display:grid;place-items:center;height:100vh;color:var(--muted);font-family:var(--mono);}
 
@@ -3015,12 +3033,15 @@ function Style() {
   color:var(--ink);font-weight:600;font-size:14.5px;transition:.15s;}
 .pos-root .outline-btn:hover:not(:disabled){background:var(--paper);}
 .pos-root .outline-btn:disabled{opacity:.6;cursor:default;}
-.receipt-modal{max-height:calc(100vh - 32px);display:flex;flex-direction:column;}
-.receipt-modal-body{flex:1;overflow-y:auto;display:flex;justify-content:center;
-  background:var(--paper);border-radius:12px;padding:16px;}
-.pos-root .receipt-done{margin-top:16px;flex-shrink:0;}
-.receipt-modal-body img{width:100%;max-width:280px;height:auto;align-self:flex-start;
-  background:#fff;box-shadow:0 6px 16px rgba(20,28,45,.08);}
+.receipt-page{max-width:440px;margin:0 auto;padding:20px 16px 40px;}
+.receipt-page-title{font-family:var(--display);font-size:22px;font-weight:700;margin:14px 0 16px;
+  color:var(--ink);}
+.receipt-page-title span{color:var(--muted);font-weight:600;}
+.receipt-page-paper{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:16px;box-shadow:0 6px 16px rgba(20,28,45,.08);}
+.receipt-page-paper img{display:block;width:100%;height:auto;}
+.receipt-page-actions{display:flex;flex-direction:column;gap:10px;margin-top:18px;}
+.pos-root .receipt-page-actions .new-order{margin-top:0;}
 
 /* ---- auth ---- */
 .auth-root{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;}
