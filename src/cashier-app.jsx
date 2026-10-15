@@ -635,6 +635,7 @@ export default function CashierApp() {
   const [printerBusy, setPrinterBusy] = useState(false);
   const [printerMsg, setPrinterMsg] = useState(null); // {ok, text}
   const [printingSale, setPrintingSale] = useState(null); // sale being sent to the browser print fallback
+  const [receiptView, setReceiptView] = useState(null); // sale whose receipt is shown on screen
   // Which BLE byte protocol to speak — "cat" (GB01/YHK-rabbit family, the
   // original target hardware) or "escpos" (genuinely ESC/POS-compliant
   // printers). Remembered per-browser since it's a property of whatever
@@ -1974,18 +1975,52 @@ export default function CashierApp() {
                 Change due <strong>{rp(success.change)}</strong>
               </div>
             )}
-            <button className="new-order print-btn" onClick={() => printReceipt(success)} disabled={printerBusy}>
-              <Printer size={16} />
-              {printerBusy ? "Printing…" : printer ? "Print receipt" : "Print receipt (browser)"}
-            </button>
-            <button className="new-order print-btn ghost" onClick={() => downloadReceipt(success)}>
-              <Share2 size={16} /> Save / share receipt
-            </button>
+            <div className="paid-actions">
+              <button className="outline-btn" onClick={() => printReceipt(success)} disabled={printerBusy}>
+                <Printer size={16} />
+                {printerBusy ? "Printing…" : printer ? "Print receipt" : "Print receipt (browser)"}
+              </button>
+              <button className="outline-btn" onClick={() => setReceiptView(success)}>
+                <Receipt size={16} /> Print receipt (mobile)
+              </button>
+              <button className="outline-btn" onClick={() => downloadReceipt(success)}>
+                <Share2 size={16} /> Save / share receipt
+              </button>
+            </div>
             {printerMsg && (
               <div className={"pw-msg" + (printerMsg.ok ? " ok" : " err")}>{printerMsg.text}</div>
             )}
-            <button className="new-order" onClick={() => setSuccess(null)}>
-              New order
+            <button
+              className="new-order"
+              onClick={() => {
+                setSuccess(null);
+                setView("cashier");
+              }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ---------- on-screen receipt (mobile) ---------- */}
+      {receiptView && (
+        <div className="scrim" onClick={() => setReceiptView(null)}>
+          <div className="modal receipt-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>Receipt</h3>
+              <button onClick={() => setReceiptView(null)}>
+                <X size={18} />
+              </button>
+            </div>
+            <div className="receipt-modal-body">
+              <img
+                src={renderReceiptCanvas(receiptView, shopName, account?.email, shopPhone, shopLogoImg).toDataURL()}
+                alt="Receipt"
+              />
+            </div>
+            <button className="new-order receipt-done" onClick={() => setReceiptView(null)}>
+              Done
             </button>
           </div>
         </div>
@@ -2970,13 +3005,22 @@ function Style() {
 .paid-change{margin-top:12px;padding:11px;background:var(--paper);border-radius:11px;
   font-size:14px;color:var(--muted);}
 .paid-change strong{font-family:var(--mono);color:var(--ink);margin-left:6px;}
-.new-order{margin-top:22px;width:100%;height:48px;border-radius:12px;background:var(--ink);
+.pos-root .new-order{margin-top:22px;width:100%;height:48px;border-radius:12px;background:var(--ink);
   color:#fff;font-weight:600;font-size:15px;transition:.15s;}
-.new-order:hover{background:#0f1728;}
-.new-order:disabled{opacity:.6;cursor:default;}
-.print-btn{display:flex;align-items:center;justify-content:center;gap:8px;
-  background:var(--card);border:1px solid var(--line);color:var(--ink);}
-.print-btn:hover{background:var(--card);border-color:var(--accent);}
+.pos-root .new-order:hover{background:#0f1728;}
+.pos-root .new-order:disabled{opacity:.6;cursor:default;}
+.paid-actions{display:flex;flex-direction:column;gap:10px;margin-top:22px;}
+.pos-root .outline-btn{width:100%;height:46px;border-radius:12px;display:flex;align-items:center;
+  justify-content:center;gap:8px;background:transparent;border:1.5px solid var(--ink);
+  color:var(--ink);font-weight:600;font-size:14.5px;transition:.15s;}
+.pos-root .outline-btn:hover:not(:disabled){background:var(--paper);}
+.pos-root .outline-btn:disabled{opacity:.6;cursor:default;}
+.receipt-modal{max-height:calc(100vh - 32px);display:flex;flex-direction:column;}
+.receipt-modal-body{flex:1;overflow-y:auto;display:flex;justify-content:center;
+  background:var(--paper);border-radius:12px;padding:16px;}
+.pos-root .receipt-done{margin-top:16px;flex-shrink:0;}
+.receipt-modal-body img{width:100%;max-width:280px;height:auto;align-self:flex-start;
+  background:#fff;box-shadow:0 6px 16px rgba(20,28,45,.08);}
 
 /* ---- auth ---- */
 .auth-root{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;}
